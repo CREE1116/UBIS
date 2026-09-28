@@ -1,0 +1,20 @@
+[package]
+name = "ubis-bench"
+description = "UBIS evaluation harness: git-derived unit-level queries with a temporal split"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ubis-bench"
+path = "src/main.rs"
+
+[dependencies]
+ubis-core = { path = "../ubis-core" }
+ubis-ingest = { path = "../ubis-ingest" }
+ubis-git = { path = "../ubis-git" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

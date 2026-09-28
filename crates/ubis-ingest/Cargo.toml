@@ -1,0 +1,20 @@
+[package]
+name = "ubis-ingest"
+description = "UBIS ingest: text admission, extractors, and incremental indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ubis-core = { path = "../ubis-core" }
+anyhow.workspace = true
+serde.workspace = true
+blake3.workspace = true
+ignore.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-java.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

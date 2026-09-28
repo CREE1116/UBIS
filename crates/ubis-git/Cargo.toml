@@ -1,0 +1,9 @@
+[package]
+name = "ubis-git"
+description = "UBIS git evidence: commits and diff hunks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "ubis-core"
+description = "UBIS core: unit model, evidence store, resolver, and query cascade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
