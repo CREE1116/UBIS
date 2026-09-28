@@ -219,33 +219,7 @@ impl Session {
     // ------------------------------------------------------------ rendering
 
     pub fn render_hits(hits: &[Hit]) -> String {
-        if hits.is_empty() {
-            return "no candidates\n".into();
-        }
-        let mut s = String::new();
-        for (i, h) in hits.iter().enumerate() {
-            let lifted = if h.lifted > 0 {
-                format!("  [{} matches inside]", h.lifted)
-            } else {
-                String::new()
-            };
-            s += &format!(
-                "[{}] {}:{}-{}  {}  ({}){}\n",
-                i + 1,
-                h.path,
-                h.start_line,
-                h.end_line,
-                h.id,
-                h.kind.as_str(),
-                lifted
-            );
-            if !h.signature.is_empty() {
-                s += &format!("    {}\n", h.signature);
-            }
-            let via: Vec<_> = h.via.iter().map(|v| format!("{} {:.2}", v.op, v.contribution)).collect();
-            s += &format!("    via {}\n", via.join(", "));
-        }
-        s
+        ubis_core::render::hits(hits)
     }
 
     pub fn render_open(u: &UnitRow, children: &[UnitRow]) -> String {

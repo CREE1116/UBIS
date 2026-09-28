@@ -81,7 +81,9 @@ cargo build --release
 **설계 선호: 사용자와 에이전트가 알아야 할 것을 최소로.** 명령 두 개(`find`, `near`)면 되게 한다. 수동 단계(색인)는 자동으로 대체하고, 기각된 실험은 플래그로 남기지 말고 코드에서 지운다(기록은 REPORT.md). 새 인터페이스(MCP 등)는 스킬 + CLI로 안 될 때만.
 
 **측정으로 확인된 것** (REPORT.md):
-- **PR 태스크(실제 작업 질의)**: `find->near` 2-call이 네 코퍼스 모두에서 grep → 파일 3개 읽기보다 recall이 높다(fd 0.414 vs 0.373, ripgrep 0.345 vs 0.250, requests 0.380 vs 0.278, flask 0.343 vs 0.327), 토큰 1/8~1/20. 어형 불일치는 어간 추출(E10)로 줄었고, 남은 어휘 불일치(다른 단어)는 E2 대상.
+- **PR 태스크(실제 작업 질의)**: `find` 1 call이 fd·ripgrep·requests에서, `find->near` 2 call이 네 코퍼스 모두에서 grep → 파일 3개 읽기보다 recall이 높다(find->near: fd 0.469, ripgrep 0.366, requests 0.413, flask 0.336 vs grep 0.373/0.250/0.278/0.327). 총 토큰(목록+읽기) 1/10~1/29.
+- **비용은 총량으로 본다:** 벤치의 `total_tok` = span 읽기 + `ubis` 출력 목록, `calls` = 도구 호출 수. 도구 자체의 출력·호출이 비용을 늘리지 않게 하는 것이 목적이다. 목록은 총비용의 ~10%, 읽기가 ~90%.
+- 기각 기록(E11): 한 번에 find→near 확장(효율 나쁨), PRF(query drift), lift 축소(recall 손실).
 - **채점은 고정:** 벤치의 정답 매핑과 grep baseline은 `tokenize_raw`. 검색 쪽 토크나이저를 바꿔도 정답 집합이 움직이지 않는다.
 - text: fd에서 grep-read@1보다 recall 높고 토큰 1/5. 절대 recall은 낮다(0.25).
 - anchor: 대부분 `tree_near`/`same_file`이 한다. 참조 엣지 기여는 작다(+0.05).

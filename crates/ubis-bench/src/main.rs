@@ -84,10 +84,20 @@ struct Agg {
     hits: usize,
     returned_sum: usize,
     read_tokens_sum: f64,
+    list_tokens_sum: f64,
+    calls_sum: usize,
 }
 
 impl Agg {
     fn add(&mut self, recall: f64, returned: usize, tokens: f64) {
+        self.add_cost(recall, returned, tokens, 0.0, 1);
+    }
+
+    /// `list` = tokens of the tool output an agent reads before opening any
+    /// span; `calls` = tool calls spent.
+    fn add_cost(&mut self, recall: f64, returned: usize, tokens: f64, list: f64, calls: usize) {
+        self.list_tokens_sum += list;
+        self.calls_sum += calls;
         self.queries += 1;
         self.recall_sum += recall;
         if recall > 0.0 {
@@ -99,13 +109,16 @@ impl Agg {
     fn row(&self, name: &str) -> String {
         let n = self.queries.max(1) as f64;
         format!(
-            "{:<22} {:>5} {:>9.3} {:>9.3} {:>9.1} {:>11.0}",
+            "{:<22} {:>5} {:>9.3} {:>9.3} {:>9.1} {:>11.0} {:>9.0} {:>11.0} {:>6.1}",
             name,
             self.queries,
             self.recall_sum / n,
             self.hits as f64 / n,
             self.returned_sum as f64 / n,
-            self.read_tokens_sum / n
+            self.read_tokens_sum / n,
+            self.list_tokens_sum / n,
+            (self.read_tokens_sum + self.list_tokens_sum) / n,
+            self.calls_sum as f64 / n
         )
     }
 }
@@ -197,8 +210,8 @@ fn print_table(args: &Args, aggs: &BTreeMap<&'static str, Agg>) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<22} {:>5} {:>9} {:>9} {:>9} {:>11}",
-        "method", "n", "recall", "hit", "returned", "read_tok"
+        "{:<22} {:>5} {:>9} {:>9} {:>9} {:>11} {:>9} {:>11} {:>6}",
+        "method", "n", "recall", "hit", "returned", "read_tok", "list_tok", "total_tok", "calls"
     );
     for (name, a) in aggs {
         println!("{}", a.row(name));
@@ -323,8 +336,8 @@ fn evaluate(
     let subject = text.lines().next().unwrap_or("");
 
     if !tokenize(text).is_empty() {
-        let (r, n, t, hits) = run(store, &query(text, None), gold, args)?;
-        aggs.entry("ubis text").or_default().add(r, n, t);
+        let (r, n, t, hits, list) = run(store, &query(text, None), gold, args)?;
+        aggs.entry("ubis text").or_default().add_cost(r, n, t, list, 1);
         if args.verbose {
             eprintln!("[text] {:.2} {:>3} | {} | gold {:?}", r, n, subject, gold_vec);
         }
@@ -335,7 +348,7 @@ fn evaluate(
         }
         // Agent flow: find, then `near` on the top hit with the same text; read both lists.
         if let Some(top) = hits.first() {
-            let (_, _, _, more) = run(store, &query(text, Some(top.clone())), gold, args)?;
+            let (_, _, _, more, list2) = run(store, &query(text, Some(top.clone())), gold, args)?;
             let mut seen: Vec<String> = hits.clone();
             for h in more {
                 if !seen.contains(&h) {
@@ -343,7 +356,7 @@ fn evaluate(
                 }
             }
             let (r, t) = score(store, &seen, gold)?;
-            aggs.entry("ubis find->near").or_default().add(r, seen.len(), t);
+            aggs.entry("ubis find->near").or_default().add_cost(r, seen.len(), t, list + list2, 2);
         }
     }
 
@@ -351,8 +364,8 @@ fn evaluate(
         let anchor = gold_vec[0].clone();
         let rest: BTreeSet<String> = gold_vec[1..].iter().cloned().collect();
         for (name, t) in [("ubis anchor", ""), ("ubis anchor+text", text)] {
-            let (r, n, tok, _) = run(store, &query(t, Some(anchor.clone())), &rest, args)?;
-            aggs.entry(name).or_default().add(r, n, tok);
+            let (r, n, tok, _, list) = run(store, &query(t, Some(anchor.clone())), &rest, args)?;
+            aggs.entry(name).or_default().add_cost(r, n, tok, list, 1);
             if args.verbose {
                 eprintln!("[{name}] {:.2} {:>3} | {} | anchor {}", r, n, subject, anchor);
             }
@@ -377,7 +390,7 @@ fn run(
     q: &Query,
     gold: &BTreeSet<String>,
     args: &Args,
-) -> Result<(f64, usize, f64, Vec<String>)> {
+) -> Result<(f64, usize, f64, Vec<String>, f64)> {
     let mut p = plan(q);
     p.ops.retain(|(op, _)| !args.disable.iter().any(|d| d == op.name()));
     for spec in &args.weight {
@@ -392,9 +405,9 @@ fn run(
         }
     }
     let resp = search_with(store, q, p)?;
-    let ids: Vec<String> = resp.hits.into_iter().map(|h| h.id).collect();
+    let ids: Vec<String> = resp.hits.iter().map(|h| h.id.clone()).collect();
     let (r, t) = score(store, &ids, gold)?;
-    Ok((r, ids.len(), t, ids))
+    Ok((r, ids.len(), t, ids, tokens_of(&ubis_core::render::hits(&resp.hits))))
 }
 
 /// Recall of `gold` by returned units (a hit covers its descendants) and the

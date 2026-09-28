@@ -105,40 +105,64 @@ impl Default for Lexical {
     }
 }
 
-impl Operator for Lexical {
-    fn name(&self) -> &'static str {
-        "lexical"
-    }
-
-    fn generate(&self, store: &Store, q: &Query, _ctx: &Context) -> Result<Vec<(UnitId, f64)>> {
-        let mut terms = tokenize(&q.text);
-        terms.sort();
-        terms.dedup();
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
+impl Lexical {
+    /// BM25 over weighted terms (a plain query has every weight 1).
+    fn score(&self, store: &Store, terms: &[(String, f64)], scope: Option<&str>) -> Result<HashMap<UnitId, f64>> {
         let stats = store.stats()?;
         let n = stats.leaves as f64;
         let avg = stats.avg_len.max(1.0);
         let mut scores: HashMap<UnitId, f64> = HashMap::new();
-        for term in terms {
-            let postings = store.postings(&term)?;
+        for (term, w) in terms {
+            let postings = store.postings(term)?;
             let df = postings.len() as f64;
             if df == 0.0 {
                 continue;
             }
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
             for (id, tf, len, path) in postings {
-                if let Some(scope) = &q.scope {
-                    if !path.starts_with(scope.as_str()) {
-                        continue;
-                    }
+                if scope.is_some_and(|s| !path.starts_with(s)) {
+                    continue;
                 }
                 let denom = tf + self.k1 * (1.0 - self.b + self.b * len / avg);
-                *scores.entry(id).or_default() += idf * tf * (self.k1 + 1.0) / denom;
+                *scores.entry(id).or_default() += w * idf * tf * (self.k1 + 1.0) / denom;
             }
         }
-        Ok(top(scores, self.limit))
+        Ok(scores)
+    }
+}
+
+/// Query terms weighted by how the asker used them: `1 + ln(qtf)` for words
+/// repeated in the query, ×1.5 for words in the first line when there is
+/// more (a task's title says what it is about; its body adds context and
+/// noise). Measured on PR tasks (REPORT.md E11).
+fn weighted_terms(text: &str) -> Vec<(String, f64)> {
+    const TITLE_BOOST: f64 = 1.5;
+    let mut qtf: BTreeMap<String, f64> = BTreeMap::new();
+    for t in tokenize(text) {
+        *qtf.entry(t).or_default() += 1.0;
+    }
+    let has_body = text.trim_end().contains('\n');
+    let title: BTreeSet<String> = tokenize(text.lines().next().unwrap_or("")).into_iter().collect();
+    qtf.into_iter()
+        .map(|(t, c)| {
+            let boost = if has_body && title.contains(&t) { TITLE_BOOST } else { 1.0 };
+            let w = (1.0 + c.ln()) * boost;
+            (t, w)
+        })
+        .collect()
+}
+
+impl Operator for Lexical {
+    fn name(&self) -> &'static str {
+        "lexical"
+    }
+
+    fn generate(&self, store: &Store, q: &Query, _ctx: &Context) -> Result<Vec<(UnitId, f64)>> {
+        let terms = weighted_terms(&q.text);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(top(self.score(store, &terms, q.scope.as_deref())?, self.limit))
     }
 }
 

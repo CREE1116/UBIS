@@ -85,15 +85,17 @@ pub struct Unit {
 
 impl Unit {
     /// First non-empty line, trimmed and bounded; used as a one-line preview.
+    /// One informative line: the first non-empty line that is not an
+    /// attribute or decorator (`#[derive(..)]`, `@property`), cut to 100 chars.
     pub fn signature(&self) -> String {
-        let line = self
-            .text
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
-        let mut out: String = line.chars().take(160).collect();
-        if line.chars().count() > 160 {
+        const MAX: usize = 100;
+        let mut lines = self.text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let first = lines.clone().next().unwrap_or("");
+        let line = lines
+            .find(|l| !(l.starts_with("#[") || l.starts_with("#![") || l.starts_with('@')))
+            .unwrap_or(first);
+        let mut out: String = line.chars().take(MAX).collect();
+        if line.chars().count() > MAX {
             out.push('…');
         }
         out

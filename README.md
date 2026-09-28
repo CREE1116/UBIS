@@ -83,12 +83,14 @@ ubis find "adaptive cut K"
 ```
 
 ```text
-[1] crates/ubis-core/src/query.rs:527-535  …::tests::adaptive_k_cuts_at_largest_gap  (function)
-    via lexical 1.00
-[3] crates/ubis-core/src/query.rs:490-494  crates/ubis-core/src/query.rs::adaptive_k  (function)
-    /// Cut at the largest score drop within `[K_MIN, k_max]`, subject to keeping
-    via lexical 0.97
+# sharkdp/fd에서: ubis find "min-depth broken symlink"
+tests/tests.rs:1211-1246 test_min_depth_broken_symlink · lexical
+  /// Minimum depth with a broken symlink (regression test for #1017)
+src/dir_entry.rs:100-105 DirEntry::depth · lexical symbol
+  pub fn depth(&self) -> Option<usize> {
 ```
+
+한 후보에 두 줄: 읽을 위치(`path:start-end`, 그대로 `near`의 인자로 쓸 수 있다), 이름, 근거(`via`), 그리고 한 줄 요약.
 
 식별자형 질의(`Store::open`, `rebuild_edges`)는 planner가 알아보고 `symbol` operator 가중치를 올린다.
 
@@ -100,17 +102,12 @@ ubis near src/exec/job.rs::batch -k 8      # src/exec/job.rs:50 처럼 줄 번�
 ```
 
 ```text
-[1] src/exec/job.rs:7-43  src/exec/job.rs::job  (function)
-    /// An event loop that listens for inputs from the `rx` receiver. Each received input will
-    via tree_near 0.30, same_file 0.20, cochange 0.50
-[2] src/exec/mod.rs:90-120  src/exec/mod.rs::CommandSet::execute_batch  (method)
-    pub fn execute_batch<I>(&self, paths: I, limit: usize, path_separator: Option<&str>) -> ExitCode
-    via refs_out 0.80, cochange 0.10
-[3] src/config.rs:13-136  src/config.rs::Config  (type)
-    /// Configuration options for *fd*.
-    via refs_out 0.80, cochange 0.06
-[6] src/exit_codes.rs:6-12  src/exit_codes.rs::ExitCode  (type)
-    via refs_out 0.80
+src/exec/job.rs:7-43 job · cochange tree_near same_file
+  /// An event loop that listens for inputs from the `rx` receiver. Each received input will
+src/exec/mod.rs:90-120 CommandSet::execute_batch · refs_out cochange
+  pub fn execute_batch<I>(&self, paths: I, limit: usize, path_separator: Option<&str>) -> ExitCode
+src/config.rs:13-136 Config · refs_out cochange
+  /// Configuration options for *fd*.
 ```
 
 anchor만 주면 이동이 된다. 이 unit을 참조하는 곳, 이 unit이 참조하는 곳, 형제 unit, 같은 파일의 다른 unit, 그리고 **과거 커밋에서 같이 바뀐 unit**이 후보로 나온다.
@@ -317,14 +314,14 @@ flowchart LR
     PR -.비교.-> G["grep → 파일 3개 통째<br/>≈ 24~59k tok"]
 ```
 
-| 코퍼스 (태스크 수) | grep → 파일 3개 읽기 | **ubis find→near** | 토큰 비율 |
+| 코퍼스 (태스크 수) | grep → 파일 3개 읽기 | **ubis find** (1 call) | **ubis find→near** (2 calls) |
 |---|---:|---:|---:|
-| sharkdp/fd (67) | 0.373 / 24,304 tok | **0.414** / 2,957 tok | 1/8 |
-| BurntSushi/ripgrep (178) | 0.250 / 59,062 tok | **0.345** / 3,368 tok | 1/18 |
-| psf/requests (114) | 0.278 / 41,214 tok | **0.380** / 2,018 tok | 1/20 |
-| pallets/flask (140) | 0.327 / 35,673 tok | **0.343** / 2,153 tok | 1/17 |
+| sharkdp/fd (67) | 0.373 / 24,304 tok | **0.408** / 1,982 tok | **0.469** / 3,117 tok |
+| BurntSushi/ripgrep (178) | 0.250 / 59,062 tok | **0.323** / 2,473 tok | **0.366** / 3,711 tok |
+| psf/requests (114) | 0.278 / 41,214 tok | **0.368** / 1,407 tok | **0.413** / 2,340 tok |
+| pallets/flask (140) | 0.327 / 35,673 tok | 0.302 / 1,244 tok | **0.336** / 2,232 tok |
 
-recall = PR이 바꾼 unit 중 찾은 비율. 네 코퍼스 모두에서 grep+파일 읽기보다 많이 찾으면서 토큰은 1/8~1/20.
+recall = PR이 바꾼 unit 중 찾은 비율. 토큰 = ubis 출력(목록) + 돌려준 span을 모두 읽는 양 — 에이전트가 실제로 쓰는 총량이다. `find` 한 번으로 세 코퍼스에서 grep+파일 읽기보다 많이 찾고(토큰 1/12~1/29), `near`까지 두 번이면 네 코퍼스 모두에서 이긴다.
 
 ```bash
 python3 crates/ubis-bench/scripts/fetch_pr_tasks.py sharkdp/fd path/to/fd tasks.jsonl   # gh 필요

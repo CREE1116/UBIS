@@ -10,6 +10,7 @@
 pub mod cochange;
 pub mod model;
 pub mod query;
+pub mod render;
 pub mod resolve;
 pub mod store;
 pub mod tokenize;
