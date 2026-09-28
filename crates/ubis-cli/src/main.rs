@@ -83,9 +83,15 @@ fn main() -> Result<()> {
         Cmd::Watch { path, debounce_ms } => cmd_watch(&cli, path, *debounce_ms),
         Cmd::Find { text, anchor, scope, k } => {
             let store = open_store(&cli)?;
+            // Same resolution as `near`: an ambiguous anchor lists its
+            // candidates instead of silently taking one.
+            let anchor = match anchor {
+                Some(a) => Some(resolve_unit(&store, a)?.id),
+                None => None,
+            };
             let q = Query {
                 text: text.join(" "),
-                anchor: anchor.clone(),
+                anchor,
                 scope: scope.clone(),
                 k_max: *k,
                 k_min: None,
@@ -202,25 +208,17 @@ fn cmd_index(cli: &Cli, path: &Path, git: bool) -> Result<()> {
 /// Record git history and derive co-change, unless HEAD and the indexed
 /// files are unchanged since the last run (then the rows would be identical).
 fn index_git(store: &mut Store, root: &Path) -> Result<String> {
-    use ubis_ingest::history::{git_basis, rebuild_cochange, BASIS_KEY};
+    use ubis_ingest::history::{git_basis, History, BASIS_KEY};
     let basis = git_basis(store, root)?;
     if store.meta(BASIS_KEY)?.as_deref() == Some(basis.as_str()) {
         return Ok("; git history unchanged".into());
     }
     let history = ubis_git::history(root, "HEAD", 5000)?;
     let now = history.last().map(|c| c.ts).unwrap_or(0);
-    let pairs = rebuild_cochange(store, root, &history, &ubis_core::cochange::CoChangeParams::at(now))?;
-    let commits = history.len();
-    let rows: Vec<_> = history
-        .into_iter()
-        .map(|c| {
-            let hunks = c.hunks.into_iter().map(|h| (h.path, h.start, h.len)).collect();
-            (c.id, c.ts, c.subject, hunks)
-        })
-        .collect();
-    store.replace_history(&rows)?;
+    let params = ubis_core::cochange::CoChangeParams::at(now);
+    let pairs = History::open(root)?.record_and_derive(store, &history, &params)?;
     store.set_meta(BASIS_KEY, &basis)?;
-    Ok(format!("; commits {commits}, co-change pairs {pairs}"))
+    Ok(format!("; commits {}, co-change pairs {pairs}", history.len()))
 }
 
 fn cmd_watch(cli: &Cli, path: &Path, debounce_ms: u64) -> Result<()> {

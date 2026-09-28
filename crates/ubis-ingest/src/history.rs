@@ -5,136 +5,200 @@
 //! current index:
 //!
 //! * named units (`path::Type::method`, `path#section`) match by ID;
-//! * ordinal units (`¶3`, `~2`, `code1`) shift when text is inserted above
-//!   them, so they match the current ordinal leaf in the same file with the
-//!   highest token Jaccard (≥ [`ORDINAL_JACCARD`]).
+//! * ordinal units ([`UnitKind::is_ordinal`]: `¶3`, `~2`, `code1`) shift
+//!   when text is inserted above them, so they match the current ordinal
+//!   leaf in the same file with the highest token Jaccard
+//!   (≥ [`ORDINAL_JACCARD`]).
 //!
-//! Blobs are read through one `git cat-file --batch` process and each
-//! `(path, blob)` is extracted at most once; paths that are not indexed now
-//! are never read.
+//! [`History`] reads blobs through one `git cat-file --batch` process and
+//! extracts each `(path, blob)` at most once, across any number of indexes;
+//! paths that are not indexed now are never read.
+//!
+//! [`UnitKind::is_ordinal`]: ubis_core::model::UnitKind::is_ordinal
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::Result;
 use ubis_core::cochange::{CoChangeIndex, CoChangeParams};
 use ubis_core::model::UnitId;
 use ubis_core::tokenize::tokenize;
+use ubis_core::store::CommitRow;
 use ubis_core::Store;
 use ubis_git::{BlobReader, Commit};
 
 pub const ORDINAL_JACCARD: f64 = 0.3;
 
+/// A leaf of a file as of some commit.
 struct Leaf {
     start: usize,
     end: usize,
     id: UnitId,
-    ordinal: bool,
-    text: String,
-    /// Lazily computed mapping onto a current unit.
-    mapped: Option<Option<UnitId>>,
+    /// Token set, kept only for ordinal leaves (the only ones matched by content).
+    tokens: Option<BTreeSet<String>>,
 }
 
-pub struct UnitMapper<'a> {
-    store: &'a Store,
+/// Git access plus a parse cache keyed by `(path, blob)`. Independent of any
+/// index, so it can be reused across many stores (e.g. one per evaluation task).
+pub struct History {
     reader: BlobReader,
-    indexed: HashSet<String>,
-    blobs: HashMap<(String, String), Vec<Leaf>>,
-    /// Current ordinal leaves per path with their token sets.
-    current: HashMap<String, Vec<(UnitId, BTreeSet<String>)>>,
+    leaves: HashMap<(String, String), Rc<Vec<Leaf>>>,
 }
 
-impl<'a> UnitMapper<'a> {
-    pub fn new(store: &'a Store, repo: &Path) -> Result<Self> {
+impl History {
+    pub fn open(repo: &Path) -> Result<Self> {
         Ok(Self {
-            store,
             reader: BlobReader::new(repo)?,
+            leaves: HashMap::new(),
+        })
+    }
+
+    /// A mapper onto the units of `store`. Drop it before changing the store.
+    pub fn mapper<'a>(&'a mut self, store: &'a Store) -> Result<UnitMapper<'a>> {
+        Ok(UnitMapper {
             indexed: store.file_paths()?.into_iter().collect(),
-            blobs: HashMap::new(),
+            store,
+            history: self,
+            mapped: HashMap::new(),
             current: HashMap::new(),
         })
     }
 
+    /// Record `commits` as evidence, then derive co-change from what was
+    /// recorded (the store, not git, is the source). Returns unit pairs.
+    pub fn record_and_derive(&mut self, store: &mut Store, commits: &[Commit], p: &CoChangeParams) -> Result<usize> {
+        let rows: Vec<CommitRow> = commits.iter().map(to_row).collect();
+        store.replace_history(&rows)?;
+        self.derive_cochange(store, p)
+    }
+
+    /// Recompute the derived co-change table from recorded history.
+    pub fn derive_cochange(&mut self, store: &mut Store, p: &CoChangeParams) -> Result<usize> {
+        let commits: Vec<Commit> = store.history()?.into_iter().map(from_row).collect();
+        self.rebuild_cochange(store, &commits, p)
+    }
+
+    /// Recompute the derived co-change table from `commits` against the
+    /// current index. Returns the number of unit pairs stored.
+    pub fn rebuild_cochange(&mut self, store: &mut Store, commits: &[Commit], p: &CoChangeParams) -> Result<usize> {
+        let mut tx = Vec::new();
+        {
+            let mut mapper = self.mapper(store)?;
+            for c in commits {
+                let s = mapper.touched(c)?;
+                if s.len() >= 2 {
+                    tx.push((c.ts, s));
+                }
+            }
+        }
+        store.replace_cochange(&CoChangeIndex::build(&tx, p))
+    }
+
+    fn leaves(&mut self, path: &str, blob: &str) -> Result<Rc<Vec<Leaf>>> {
+        let key = (path.to_string(), blob.to_string());
+        if let Some(l) = self.leaves.get(&key) {
+            return Ok(l.clone());
+        }
+        let parsed = self
+            .reader
+            .read(blob)?
+            .and_then(|c| crate::admit(Path::new(path), c.as_bytes()))
+            .and_then(|c| crate::extract(path, &c).ok());
+        let leaves = match parsed {
+            Some(ex) => {
+                let parents: BTreeSet<&str> = ex.units.iter().filter_map(|u| u.parent.as_deref()).collect();
+                ex.units
+                    .iter()
+                    .filter(|u| !parents.contains(u.id.as_str()))
+                    .map(|u| Leaf {
+                        start: u.start_line,
+                        end: u.end_line,
+                        id: u.id.clone(),
+                        tokens: u.kind.is_ordinal().then(|| tokenize(&u.text).into_iter().collect()),
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let leaves = Rc::new(leaves);
+        self.leaves.insert(key, leaves.clone());
+        Ok(leaves)
+    }
+}
+
+/// Maps commit hunks onto the units of one index state.
+pub struct UnitMapper<'a> {
+    store: &'a Store,
+    history: &'a mut History,
+    indexed: HashSet<String>,
+    /// `(path, historical leaf id, its content)` → current unit.
+    mapped: HashMap<(String, UnitId, u64), Option<UnitId>>,
+    /// Current ordinal leaves per path with their token sets.
+    current: HashMap<String, Vec<(UnitId, BTreeSet<String>)>>,
+}
+
+impl UnitMapper<'_> {
     /// Leaf units of the current index touched by `c`.
     pub fn touched(&mut self, c: &Commit) -> Result<BTreeSet<UnitId>> {
         let mut out = BTreeSet::new();
         for path in c.files() {
             if !self.indexed.contains(path) {
-                continue;
+                continue; // not indexed now: nothing to map onto, never read
             }
             let Some(blob) = c.blob(path) else { continue };
-            let key = (path.to_string(), blob.to_string());
-            if !self.blobs.contains_key(&key) {
-                let leaves = self.load(path, blob)?;
-                self.blobs.insert(key.clone(), leaves);
-            }
-            let mut leaves = self.blobs.remove(&key).unwrap_or_default();
+            let leaves = self.history.leaves(path, blob)?;
             for h in c.hunks.iter().filter(|h| h.path == path) {
                 let (a, b) = (h.start, h.start + h.len - 1);
-                for leaf in leaves.iter_mut() {
-                    if leaf.start <= b && a <= leaf.end {
-                        if leaf.mapped.is_none() {
-                            leaf.mapped = Some(self.map(path, leaf)?);
-                        }
-                        if let Some(Some(id)) = &leaf.mapped {
-                            out.insert(id.clone());
-                        }
+                for leaf in leaves.iter().filter(|l| l.start <= b && a <= l.end) {
+                    if let Some(id) = self.map(path, leaf)? {
+                        out.insert(id);
                     }
                 }
             }
-            self.blobs.insert(key, leaves);
         }
         Ok(out)
     }
 
-    fn load(&mut self, path: &str, blob: &str) -> Result<Vec<Leaf>> {
-        let Some(content) = self.reader.read(blob)? else { return Ok(Vec::new()) };
-        let Some(content) = crate::admit(Path::new(path), content.as_bytes()) else {
-            return Ok(Vec::new());
-        };
-        let Ok(ex) = crate::extract(path, &content) else { return Ok(Vec::new()) };
-        let parents: BTreeSet<&str> = ex.units.iter().filter_map(|u| u.parent.as_deref()).collect();
-        Ok(ex
-            .units
-            .iter()
-            .filter(|u| !parents.contains(u.id.as_str()))
-            .map(|u| Leaf {
-                start: u.start_line,
-                end: u.end_line,
-                ordinal: is_ordinal(&u.id),
-                id: u.id.clone(),
-                text: if is_ordinal(&u.id) { u.text.clone() } else { String::new() },
-                mapped: None,
-            })
-            .collect())
-    }
-
     fn map(&mut self, path: &str, leaf: &Leaf) -> Result<Option<UnitId>> {
-        if !leaf.ordinal {
+        let Some(tokens) = &leaf.tokens else {
             return Ok(self.store.unit(&leaf.id)?.map(|u| u.id));
+        };
+        let key = (path.to_string(), leaf.id.clone(), token_key(tokens));
+        if let Some(m) = self.mapped.get(&key) {
+            return Ok(m.clone());
         }
         if !self.current.contains_key(path) {
             let cur = self
                 .store
                 .units_in_file(path)?
                 .into_iter()
-                .filter(|u| u.is_leaf && is_ordinal(&u.id))
+                .filter(|u| u.is_leaf && u.kind.is_ordinal())
                 .map(|u| (u.id, tokenize(&u.text).into_iter().collect()))
                 .collect();
             self.current.insert(path.to_string(), cur);
         }
-        let toks: BTreeSet<String> = tokenize(&leaf.text).into_iter().collect();
-        Ok(self.current[path]
+        let best = self.current[path]
             .iter()
-            .map(|(id, t)| (jaccard(&toks, t), id))
+            .map(|(id, t)| (jaccard(tokens, t), id))
             .filter(|(j, _)| *j >= ORDINAL_JACCARD)
             .max_by(|x, y| x.0.total_cmp(&y.0).then_with(|| y.1.cmp(x.1)))
-            .map(|(_, id)| id.clone()))
+            .map(|(_, id)| id.clone());
+        self.mapped.insert(key, best.clone());
+        Ok(best)
     }
 }
 
+/// Order-independent fingerprint of a token set (cache key only).
+fn token_key(tokens: &BTreeSet<String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tokens.hash(&mut h);
+    h.finish()
+}
+
 /// Bump when the co-change derivation or its parameters change.
-const COCHANGE_VERSION: &str = "cochange-v1";
+const COCHANGE_VERSION: &str = "cochange-v2";
 pub const BASIS_KEY: &str = "git_basis";
 
 /// Everything the derived git tables depend on: HEAD, the indexed files, and
@@ -151,29 +215,28 @@ pub fn git_basis(store: &Store, repo: &Path) -> Result<String> {
     Ok(format!("{COCHANGE_VERSION}:{head}:{}", h.finalize().to_hex()))
 }
 
-/// `(commit time, touched units)` for every commit touching ≥ 2 indexed units.
-pub fn transactions(store: &Store, repo: &Path, commits: &[Commit]) -> Result<Vec<(i64, BTreeSet<UnitId>)>> {
-    let mut mapper = UnitMapper::new(store, repo)?;
-    let mut tx = Vec::new();
-    for c in commits {
-        let s = mapper.touched(c)?;
-        if s.len() >= 2 {
-            tx.push((c.ts, s));
-        }
+pub fn to_row(c: &Commit) -> CommitRow {
+    CommitRow {
+        id: c.id.clone(),
+        ts: c.ts,
+        subject: c.subject.clone(),
+        hunks: c.hunks.iter().map(|h| (h.path.clone(), h.start, h.len)).collect(),
+        blobs: c.blobs.clone(),
     }
-    Ok(tx)
 }
 
-/// Recompute the derived co-change table from `commits` against the current
-/// index. Returns the number of unit pairs stored.
-pub fn rebuild_cochange(store: &mut Store, repo: &Path, commits: &[Commit], p: &CoChangeParams) -> Result<usize> {
-    let tx = transactions(store, repo, commits)?;
-    store.replace_cochange(&CoChangeIndex::build(&tx, p))
-}
-
-pub fn is_ordinal(id: &str) -> bool {
-    let last = id.rsplit(['/', '#']).next().unwrap_or("");
-    last.starts_with('¶') || last.starts_with('~') || last.starts_with("code") || !id.contains(['/', '#', ':'])
+pub fn from_row(r: CommitRow) -> Commit {
+    Commit {
+        id: r.id,
+        ts: r.ts,
+        subject: r.subject,
+        hunks: r
+            .hunks
+            .into_iter()
+            .map(|(path, start, len)| ubis_git::Hunk { path, start, len })
+            .collect(),
+        blobs: r.blobs,
+    }
 }
 
 fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
@@ -232,7 +295,8 @@ mod tests {
         let now = history.last().unwrap().ts;
 
         // Ordinal leaves map onto the current unit despite the shift.
-        let mut m = UnitMapper::new(&store, root).unwrap();
+        let mut h = History::open(root).unwrap();
+        let mut m = h.mapper(&store).unwrap();
         let notes = m.touched(&history[3]).unwrap();
         let last_para = store
             .units_in_file("notes.txt")
@@ -246,8 +310,12 @@ mod tests {
         let xy: BTreeSet<UnitId> = ["a.rs::x", "a.rs::y"].iter().map(|s| s.to_string()).collect();
         assert_eq!(m.touched(&history[1]).unwrap(), xy);
         drop(m);
+        drop(h);
 
-        let pairs = rebuild_cochange(&mut store, root, &history, &CoChangeParams::at(now)).unwrap();
+        let pairs = History::open(root)
+            .unwrap()
+            .record_and_derive(&mut store, &history, &CoChangeParams::at(now))
+            .unwrap();
         assert_eq!(pairs, 1); // x–y twice; everything else below support
         let n = store.cochange_from("a.rs::x").unwrap();
         assert_eq!(n.len(), 1);
@@ -256,7 +324,15 @@ mod tests {
         // Derived table is a pure function of evidence.
         let mut again = Store::open_in_memory().unwrap();
         crate::index_dir(&mut again, root).unwrap();
-        rebuild_cochange(&mut again, root, &history, &CoChangeParams::at(now)).unwrap();
+        History::open(root)
+            .unwrap()
+            .record_and_derive(&mut again, &history, &CoChangeParams::at(now))
+            .unwrap();
+        assert_eq!(
+            again.history().unwrap(),
+            history.iter().map(to_row).collect::<Vec<_>>(),
+            "recorded history round-trips"
+        );
         assert_eq!(store.canonical_dump().unwrap(), again.canonical_dump().unwrap());
     }
 }

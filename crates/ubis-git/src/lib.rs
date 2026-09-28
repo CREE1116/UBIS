@@ -213,6 +213,18 @@ impl Drop for BlobReader {
     }
 }
 
+/// The change from `base` to `head` as one pseudo-commit (id and time of
+/// `head`), e.g. a whole pull request.
+pub fn diff(repo: &Path, base: &str, head: &str) -> Result<Commit> {
+    let raw = git(
+        repo,
+        &["diff", "--no-color", "--no-ext-diff", "-M", "--raw", "--no-abbrev", "--unified=0", base, head],
+    )?;
+    let ts = git(repo, &["show", "-s", "--format=%ct", head])?;
+    let record = format!("\u{1e}{head}\u{1f}{}\u{1f}\n{raw}", ts.trim());
+    parse_log(&record).pop().context("empty diff record")
+}
+
 /// Full commit id of `rev`.
 pub fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
     Ok(git(repo, &["rev-parse", "--verify", rev])?.trim().to_string())

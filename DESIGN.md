@@ -16,7 +16,8 @@ $$\mathbb{E}[\text{cost}] = K\cdot t_{\text{cand}} + \sum_{\text{열람}}|\text{
 Interface   ubis CLI (find / near / refs / open / status), 에이전트 스킬
 Query       Planner → Stage A 후보 생성 → Stage B 점수 → Stage C 성형
 Derivation  Resolver (mentions ⋈ definitions → edges)   [실험: Factorizer]
-Evidence    SQLite: files, units, postings, definitions, mentions, edges, commits, hunks
+Evidence    SQLite: files, units, postings, definitions, mentions, commits, hunks, commit_blobs
+Derived     edges, cochange  (meta.git_basis로 재계산 여부 판정)
 Ingest      walker(.gitignore) → 텍스트 판별 → extractor → 파일 단위 교체
 ```
 
@@ -43,6 +44,7 @@ Ingest      walker(.gitignore) → 텍스트 판별 → extractor → 파일 단
 |---|---|---|
 | `lexical` | BM25 (leaf) | 코드 subword 분리, 한글 문자 bigram |
 | `symbol` | 정의 이름 정확 일치, $1/n$ | 식별자 질의에서 강함 |
+| `path` | 질의 첫 줄 term ↔ 파일 경로 토큰(IDF), 상위 5파일의 매칭 leaf | lexical × 0.5. scope(`printer:`)가 경로를 가리킴 |
 | `refs_in` / `refs_out` | anchor로 들어오는/나가는 엣지 질량 | 방향 있음 |
 | `tree_near` | anchor 형제, 문서 순서 거리 $1/(1+d)$ | |
 | `same_file` | anchor 파일의 다른 leaf, $1/(1+d/4)$ | 파일 내부 co-change를 unit 단위로 |

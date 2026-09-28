@@ -142,6 +142,68 @@ impl Operator for Lexical {
     }
 }
 
+/// Query terms that name a file path (`printer: fix …` → `crates/printer/…`).
+/// Files are scored by IDF over path tokens; leaves in the top files that
+/// contain a query term inherit their file's score, so path evidence ranks
+/// the right file's units up without flooding in unrelated ones.
+pub struct PathMatch {
+    pub files: usize,
+    pub title_only: bool,
+}
+
+impl Operator for PathMatch {
+    fn name(&self) -> &'static str {
+        "path"
+    }
+
+    fn generate(&self, store: &Store, q: &Query, _ctx: &Context) -> Result<Vec<(UnitId, f64)>> {
+        let text = if self.title_only { q.text.lines().next().unwrap_or("") } else { q.text.as_str() };
+        let mut terms = tokenize(text);
+        terms.sort();
+        terms.dedup();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let paths: Vec<(String, BTreeSet<String>)> = store
+            .file_paths()?
+            .into_iter()
+            .filter(|p| q.scope.as_ref().is_none_or(|s| p.starts_with(s.as_str())))
+            .map(|p| {
+                let t = tokenize(&p).into_iter().collect();
+                (p, t)
+            })
+            .collect();
+        let n = paths.len() as f64;
+        let mut file_scores: Vec<(f64, &str)> = paths
+            .iter()
+            .map(|(p, toks)| {
+                let s: f64 = terms
+                    .iter()
+                    .filter(|t| toks.contains(*t))
+                    .map(|t| {
+                        let df = paths.iter().filter(|(_, o)| o.contains(t)).count() as f64;
+                        (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+                    })
+                    .sum();
+                (s, p.as_str())
+            })
+            .filter(|(s, _)| *s > 0.0)
+            .collect();
+        file_scores.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        file_scores.truncate(self.files);
+        let chosen: BTreeMap<&str, f64> = file_scores.iter().map(|(s, p)| (*p, *s)).collect();
+        let mut scores: HashMap<UnitId, f64> = HashMap::new();
+        for term in &terms {
+            for (id, _, _, path) in store.postings(term)? {
+                if let Some(s) = chosen.get(path.as_str()) {
+                    scores.insert(id, *s);
+                }
+            }
+        }
+        Ok(top(scores, 200))
+    }
+}
+
 /// Exact symbol-name match against definitions. A query word naming a
 /// symbol defined in `n` places gives each definition `1/n`.
 pub struct Symbol {
@@ -192,7 +254,9 @@ impl Operator for RefsOut {
         for a in &ctx.anchor_set {
             for e in store.edges_from(a)? {
                 if !ctx.anchor_set.contains(&e.dst) {
-                    *scores.entry(e.dst).or_default() += e.weight;
+                    // A target everyone references says little about this anchor.
+                    let spec = if SPECIFICITY { specificity(store.in_degree(&e.dst)?) } else { 1.0 };
+                    *scores.entry(e.dst).or_default() += e.weight * spec;
                 }
             }
         }
@@ -214,7 +278,9 @@ impl Operator for RefsIn {
         for a in &ctx.anchor_set {
             for e in store.edges_to(a)? {
                 if !ctx.anchor_set.contains(&e.src) {
-                    *scores.entry(e.src).or_default() += e.weight;
+                    // A caller that references everything says little about this anchor.
+                    let spec = if SPECIFICITY { specificity(store.out_degree(&e.src)?) } else { 1.0 };
+                    *scores.entry(e.src).or_default() += e.weight * spec;
                 }
             }
         }
@@ -277,6 +343,14 @@ impl Operator for SameFile {
     }
 }
 
+/// Degree discount on refs (REPORT.md E8): mixed results, not adopted.
+pub const SPECIFICITY: bool = false;
+
+/// IDF-like discount for a unit with `degree` edges on the other side.
+fn specificity(degree: usize) -> f64 {
+    1.0 / (1.0 + (degree as f64).ln_1p())
+}
+
 fn top(scores: HashMap<UnitId, f64>, limit: usize) -> Vec<(UnitId, f64)> {
     let mut v: Vec<_> = scores.into_iter().filter(|(_, s)| *s > 0.0).collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -306,6 +380,7 @@ pub fn plan(q: &Query) -> Plan {
         };
         ops.push((Box::new(Lexical::default()), lex));
         ops.push((Box::new(Symbol { limit: 50 }), sym));
+        ops.push((Box::new(PathMatch { files: 5, title_only: PATH_TITLE_ONLY }), lex * PATH_WEIGHT));
     }
     if q.anchor.is_some() {
         ops.push((Box::new(RefsIn { limit: 50 }), 0.8));
@@ -320,6 +395,14 @@ pub fn plan(q: &Query) -> Plan {
 
 // ------------------------------------------------------------------- cascade
 
+/// `path` weight relative to `lexical`. Measured on PR tasks (REPORT.md E7):
+/// 0.5 balances ripgrep/requests/flask gains against fd; 1.0 hurt flask.
+pub const PATH_WEIGHT: f64 = 0.5;
+/// Match paths against the first line only: scopes like `printer:` live in
+/// titles; PR bodies add noise (measured: title-only better on 3 of 4).
+pub const PATH_TITLE_ONLY: bool = true;
+/// Contributions below this are left out of `via` (they would print as 0.00).
+pub const VIA_MIN: f64 = 0.005;
 pub const LIFT_MIN_SIBLINGS: usize = 4;
 pub const LIFT_MAX_LINES: usize = 300;
 /// Floor of the adaptive cut. Measured with ubis-bench: 3 cut anchor queries
@@ -356,10 +439,13 @@ pub fn search_with(store: &Store, q: &Query, plan: Plan) -> Result<Response> {
             let c = w * raw / max;
             let e = total.entry(id).or_insert((0.0, Vec::new()));
             e.0 += c;
-            e.1.push(Via {
-                op: op.name(),
-                contribution: c,
-            });
+            // Negligible evidence still counts in the score but is not shown.
+            if c >= VIA_MIN {
+                e.1.push(Via {
+                    op: op.name(),
+                    contribution: c,
+                });
+            }
         }
     }
     let candidates = total.len();

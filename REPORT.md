@@ -118,3 +118,65 @@ anchor recall / read_tok (anchor+text recall은 괄호):
 | `ubis index --git .` ripgrep 첫 실행 (903커밋) | — | 4.3s |
 | 같은 명령 재실행 (변경 없음) | 3.2s | 0.03s (`meta.git_basis` = 버전 + HEAD + 파일 해시가 같으면 생략) |
 | `ubis near` 질의 | — | 9ms |
+
+## E6: 실제 작업(PR) 질의 — `--tasks`
+
+커밋 제목은 거친 질의다. 에이전트가 실제로 받는 것은 "이 이슈를 고쳐라"에 가깝다. 그래서 병합된 GitHub PR을 태스크로 쓴다: 질의 = PR 제목 + 본문, 색인 = PR 직전 트리(`base`), 정답 = `base..head`가 바꾼 unit, co-change = `base`까지의 이력(최근 900커밋). bot(dependabot 등) PR은 제외.
+
+```bash
+python3 crates/ubis-bench/scripts/fetch_pr_tasks.py sharkdp/fd <clone> tasks_fd.jsonl   # gh 필요
+ubis-bench <clone> --tasks tasks_fd.jsonl --max-commits 900
+```
+
+PR 목록은 2026-09-28 기준 `gh pr list --state merged --limit 200`이고, 병합 커밋이 `--depth 900` 클론 안에 있는 것만 쓴다. PR 본문은 제3자 텍스트라 태스크 파일은 커밋하지 않고 스크립트만 둔다.
+
+새 방법 **`ubis find->near`**: 에이전트의 2-call 흐름. `find(text)` 후 1위 unit을 anchor로 `find(text, anchor)`, 두 목록의 합집합을 읽는다.
+
+태스크 모드는 store 하나를 태스크마다 증분 재색인하고 `History`(blob 파싱 캐시)를 공유한다. fd 90태스크 91s → 19s.
+
+## E7: `path` operator — 채택
+
+- **가설:** PR/커밋 제목의 scope(`printer: …`, `ignore/types: …`)는 파일 경로를 가리킨다. ripgrep 실패 사례 다수가 이 형태였다(`printer: fix --stats for --json` → `crates/printer/src/json.rs`).
+- **정의:** 질의 첫 줄의 term을 파일 경로 토큰에 IDF(파일 단위 df)로 매칭 → 상위 5개 파일. 그 파일에서 질의 term을 포함한 leaf가 파일 점수를 받는다. 가중치 = lexical × 0.5(텍스트 0.5, anchor 0.125). 스키마 변경 없음(질의 시점 계산).
+- **결과 (PR 태스크, find->near recall / read_tok):**
+
+| corpus (n) | grep-read@3 | 이전 | **path** | (w=1.0) | (본문까지 매칭) |
+|---|---:|---:|---:|---:|---:|
+| fd (67) | 0.373 / 24304 | 0.388 / 2685 | 0.385 / 2940 | 0.391 | 0.412 |
+| ripgrep (178) | 0.250 / 59062 | 0.178 / 3039 | **0.287** / 3394 | 0.341 | 0.273 |
+| requests (114) | 0.278 / 41214 | 0.277 / 1844 | **0.345** / 1908 | 0.328 | 0.358 |
+| flask (140) | 0.327 / 35673 | 0.265 / 2313 | **0.309** / 2101 | 0.288 | 0.304 |
+
+text(1 call) recall: fd 0.370→0.366, ripgrep 0.157→0.238, requests 0.239→0.305, flask 0.229→0.270.
+
+- **커밋 제목 모드 text recall** (`--disable path` 대비): fd 0.253→0.272, requests 0.150→0.181, ripgrep 0.214→0.316, flask 0.171→0.225. 네 코퍼스 모두 개선.
+- fd는 중립(−0.004). w=1.0은 ripgrep에 더 좋지만 flask를 깎는다. 제목만 매칭이 4개 중 3개에서 낫다.
+- **현재 기본값으로 PR 태스크에서:** `find->near`가 fd·requests·ripgrep에서 grep-read@3와 recall이 같거나 높고(ripgrep 0.287 vs 0.250), 토큰은 1/8~1/22. flask만 0.309 vs 0.327로 뒤진다(토큰 1/17).
+
+## E8: refs 차수 할인(specificity) — 기각
+
+- **가설:** 누구나 참조하는 대상(`Config`, `as_ref`)은 anchor에 대해 정보가 적다. `refs_out`은 $1/(1+\ln(1+\text{indeg}))$, `refs_in`은 out-degree로 할인. 동률(`refs_out 0.80` 7개가 ID 순)도 깬다.
+- **결과:** 커밋 anchor recall fd 0.470→0.470, requests 동일, ripgrep 0.253→0.272, flask 0.368→0.418. anchor+text ripgrep −0.008. PR 태스크 anchor ±0.006. ripgrep anchor+text 토큰 −27%.
+- 두 코퍼스 +0.02 기준을 flask 하나만 넘는다. `SPECIFICITY = false`로 두고 기록만 한다. 동률 문제 자체는 남아 있다.
+
+## 구조 정리 (동작 불변 확인)
+
+- **co-change를 기록된 증거에서 파생:** `commit_blobs(commit_id, path, blob)` 테이블 추가, `CommitRow` 구조체. `History::record_and_derive`가 이력을 먼저 기록하고 store에서 다시 읽어 co-change를 계산한다. git은 blob 내용을 읽을 때만 쓴다(content-addressed). 4개 코퍼스 수치 동일. `cochange-v2`로 basis 무효화.
+- **`History` / `UnitMapper` 분리:** 파싱 캐시((path, blob) → leaf)는 index와 무관하게 재사용, 매핑 캐시는 index 상태별. 리뷰에서 지적한 "캐시 항목 꺼냈다 넣기"도 사라졌다.
+- **서수 판정을 `UnitKind::is_ordinal()`로:** ID 문자열 파싱 제거. 파일 전체가 leaf 하나인 unit이 이제 ID로 정확히 매칭된다 → requests/flask 정답 집합이 약간 바뀜(flask 커밋 anchor n 29→30, recall 0.387→0.374, requests text 0.154→0.150). 이후 표는 모두 새 정의 기준.
+- **`find --anchor`도 `near`와 같은 해석:** 모호한 이름이면 후보를 나열하고 실패한다(전에는 조용히 첫 후보).
+- **`via` 표시:** 기여 < 0.005는 점수엔 포함, 출력에서 제외.
+
+## Dogfooding: 이 세션의 실제 수정 5건
+
+수정 **전** 트리(`cc98b0f`)를 색인하고, 각 수정을 작업 설명으로 물었다(순환 방지).
+
+| 작업 설명 | 결과 |
+|---|---|
+| find --anchor가 모호한 이름에서 첫 후보를 조용히 고름 | `find` 2위 `resolve_unit`(재사용할 함수) → `near resolve_unit` 1위 `main`(실제 수정 위치) |
+| 파일 경로와 질의어를 매칭하는 operator 추가 | `plan`, `Symbol`, `Lexical::generate` — 등록 위치와 본보기 |
+| co-change를 기록된 이력에서 파생 | `replace_history`, `rebuild_cochange`, 테스트 적중. git 파서(`parse_log`)는 놓침 |
+| via 0.00 숨기기 | `Via`, `print_hits` → `near Via` 2위 `search_with`(실제 수정 위치) |
+| 과거 파일 파싱 캐시가 태스크 사이에 사라짐 | **실패.** 설명 어휘(reparse, cache, versions)와 코드 어휘(`UnitMapper`, `blob`, `leaves`)가 다름. 코드 어휘로 물으면 1위 |
+
+관찰: 1 call로 절반, 2 call(`find→near`)로 4/5. 남은 실패는 어휘 불일치 — E2(term 확장)의 동기. 또 `x.iter()` 같은 std 메서드 호출이 로컬 `CoChangeIndex::iter`로 해석되는 잡음이 `near`에 보인다(수신 타입을 모르는 메서드 호출의 global 해석).

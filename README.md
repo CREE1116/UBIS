@@ -72,6 +72,8 @@ ubis find "토큰 만료 처리"
 | 변경 없이 재실행 (HEAD·파일 동일 → 이력 재계산 생략) | 0.03s |
 | `ubis near …` 질의 | 9ms |
 
+git 이력은 `commits` / `hunks` / `commit_blobs`로 기록되고, co-change는 **기록된 증거에서** 파생된다. git은 기록된 blob id의 내용을 다시 읽을 때만 쓴다.
+
 색인은 증분이다. 다시 실행하면 바뀐 파일만 재추출한다. 편집 중에는 `ubis watch .`로 파일 이벤트를 따라가게 둘 수 있다.
 
 ---
@@ -263,6 +265,7 @@ flowchart TB
         direction LR
         L[lexical<br/>BM25]
         S[symbol<br/>정의 이름]
+        PM[path<br/>제목 ↔ 파일 경로]
         RI[refs_in]
         RO[refs_out]
         TN[tree_near<br/>형제]
@@ -279,6 +282,7 @@ flowchart TB
 |---|---|---|
 | `lexical` | BM25 (코드 subword 분리, 한글 bigram) | 1.0 / anchor 있으면 0.25 |
 | `symbol` | 정의 이름 정확 일치, $1/n$ | 식별자형 1.2 / 자연어 0.3 / anchor 0.25 |
+| `path` | 제목 term ↔ 파일 경로 토큰 (IDF), 그 파일의 매칭 leaf | lexical × 0.5 |
 | `refs_in` · `refs_out` | anchor로 들어오는/나가는 엣지 질량 | 0.8 |
 | `tree_near` | 형제, $1/(1+d)$ | 0.3 |
 | `same_file` | 같은 파일 leaf, $1/(1+d/4)$ | 0.2 |
@@ -303,6 +307,36 @@ flowchart TB
 
 ## 평가
 
+### 실제 작업: "이 PR을 구현하라"
+
+병합된 GitHub PR을 그대로 태스크로 쓴다. 에이전트가 받는 것 = **PR 제목 + 본문**. 색인 = PR 직전 트리. 정답 = PR이 실제로 바꾼 unit.
+
+```mermaid
+flowchart LR
+    PR["PR #2039<br/>Compute depth for broken symlinks<br/>so --min-depth keeps them"] --> F["ubis find"]
+    F --> N["ubis near (1위)"]
+    N --> R["span 10~12개 읽기<br/>≈ 2~3k tok"]
+    PR -.비교.-> G["grep → 파일 3개 통째<br/>≈ 24~59k tok"]
+```
+
+| 코퍼스 (태스크 수) | grep → 파일 3개 읽기 | **ubis find→near** | 토큰 비율 |
+|---|---:|---:|---:|
+| sharkdp/fd (67) | 0.373 / 24,304 tok | **0.385** / 2,940 tok | 1/8 |
+| BurntSushi/ripgrep (178) | 0.250 / 59,062 tok | **0.287** / 3,394 tok | 1/17 |
+| psf/requests (114) | 0.278 / 41,214 tok | **0.345** / 1,908 tok | 1/22 |
+| pallets/flask (140) | 0.327 / 35,673 tok | 0.309 / 2,101 tok | 1/17 |
+
+recall = PR이 바꾼 unit 중 찾은 비율. 네 개 중 세 코퍼스에서 grep+파일 읽기보다 많이 찾으면서 토큰은 1/8~1/22.
+
+```bash
+python3 crates/ubis-bench/scripts/fetch_pr_tasks.py sharkdp/fd path/to/fd tasks.jsonl   # gh 필요
+ubis-bench path/to/fd --tasks tasks.jsonl --max-commits 900
+```
+
+**Dogfooding** (UBIS 자신): 이 레포에서 한 실제 수정 5건을 수정 전 트리에 작업 설명으로 물었을 때, `find` 1 call로 2건, `find → near` 2 call로 4건의 실제 수정 위치에 도달했다. 실패 1건은 설명 어휘와 코드 어휘가 달랐던 경우(자세한 표는 REPORT.md).
+
+### 시간 분할 (커밋 이력)
+
 git은 증거이자 채점자라서 **시간으로 자른다**.
 
 ```mermaid
@@ -319,18 +353,19 @@ flowchart LR
     Past --> Future
 ```
 
-anchor 모드 recall / 읽은 토큰 (전체 표와 재현 명령은 [REPORT.md](REPORT.md)):
+anchor 모드 recall / 읽은 토큰 — 커밋 하나가 바꾼 unit 중 하나를 주고 나머지를 찾기 (전체 표와 재현 명령은 [REPORT.md](REPORT.md)):
 
 | 코퍼스 | 파일 통째 읽기 | UBIS (co-change 전) | UBIS + co-change |
 |---|---:|---:|---:|
 | sharkdp/fd | 0.437 / 3191 | 0.351 / 1135 | **0.470** / 1760 |
 | psf/requests | 0.464 / 5254 | 0.236 / 1034 | **0.286** / 1094 |
 | BurntSushi/ripgrep | 0.327 / 12047 | 0.090 / 2034 | **0.253** / 4412 |
-| pallets/flask | 0.604 / 3778 | 0.387 / 2606 | 0.380 / 2741 |
+| pallets/flask | 0.604 / 3778 | 0.374 / 2519 | 0.368 / 2650 |
 
 ```bash
 ubis-bench path/to/repo --holdout 200 --max-commits 900            # 기본 plan
 ubis-bench path/to/repo --disable cochange                         # ablation
+ubis-bench path/to/repo --tasks tasks.jsonl                        # PR 태스크 모드
 ubis-bench path/to/repo --weight lexical=0.5 --k-min 10 -v         # 가중치, 컷, 질의별 출력
 ```
 

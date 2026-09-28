@@ -33,11 +33,11 @@ crates/ubis-core/src/
   store.rs     SQLite 스키마, 파일 단위 교체, canonical_dump (동등성 테스트용)
   resolve.rs   mentions ⋈ definitions → edges (same_file > global, Owner::method, bridge ≤3)
   cochange.rs  commits/hunks → co-change 행렬(파생 테이블 `cochange`), CoChange operator
-  query.rs     Operator trait, 7개 operator, planner, Stage B/C, adaptive_k
+  query.rs     Operator trait, 8개 operator(+path), planner, Stage B/C, adaptive_k
   tokenize.rs  코드 subword, 한글 bigram
 crates/ubis-ingest/src/
   lib.rs       admit(텍스트 판별), extract(디스패치), walk, index_dir, index_paths
-  history.rs   UnitMapper: 커밋 hunk → 현재 unit (blob 캐시, 서수 unit Jaccard), rebuild_cochange
+  history.rs   History(blob 파싱 캐시) / UnitMapper(hunk → 현재 unit), record_and_derive: 이력 기록 → store에서 co-change 파생
   tree.rs      UnitTree: ID 중복 처리, gap leaf, leaf/컨테이너 텍스트 규칙
   code.rs      tree-sitter Rust/Python/Java
   markdown.rs  heading 계층, GitHub anchor, 링크, 위키 링크
@@ -45,7 +45,8 @@ crates/ubis-ingest/src/
   prose.rs     bridge mention 추출, 문단 분할
 crates/ubis-git/   git log -p --raw --unified=0 파싱(hunk + blob id), BlobReader(cat-file --batch), archive
 crates/ubis-cli/   ubis: index / watch / find / near / refs / open / status
-crates/ubis-bench/ 시간 분할 평가 (text / anchor / anchor+text, grep-read baseline)
+crates/ubis-bench/ 시간 분할 평가 (text / anchor / anchor+text / find->near, grep-read baseline), --tasks PR 태스크 모드
+  scripts/fetch_pr_tasks.py  gh로 병합 PR → 태스크 JSONL
 integrations/skills/ubis/SKILL.md   에이전트용 사용법
 ```
 
@@ -71,13 +72,14 @@ cargo build --release
 ./target/release/ubis-bench <repo> --weight lexical=0.5 --k-min 10 -v       # 가중치, 컷, 질의별 출력
 ```
 
-지금까지 쓴 코퍼스: `sharkdp/fd@ce97e47` (Rust, `--holdout 200 --max-commits 900`), `psf/requests@611c6162` (Python, `--holdout 150 --max-commits 700`). 클론은 `--depth 900` 정도면 된다. 기본값을 바꾸면 두 코퍼스 결과를 REPORT.md에 표로 남긴다.
+지금까지 쓴 코퍼스: `sharkdp/fd@ce97e47` (Rust, `--holdout 200 --max-commits 900`), `psf/requests@611c6162` (Python, `--holdout 150 --max-commits 700`), `BurntSushi/ripgrep@3fce3b5`, `pallets/flask@d73fa1cd` (둘 다 `--holdout 200 --max-commits 900`). PR 태스크: `fetch_pr_tasks.py`로 네 레포 각각 생성 후 `--tasks … --max-commits 900`. **커밋 제목 모드보다 PR 태스크 모드를 우선 지표로 본다**(실제 작업 질의). 클론은 `--depth 900` 정도면 된다. 기본값을 바꾸면 두 코퍼스 결과를 REPORT.md에 표로 남긴다.
 
 ## 6. 현재 상태 (v0)
 
-**된 것:** unit 트리와 구조적 ID, gap leaf, SQLite 증거 저장소, 증분 색인, watch, mention→edge 해석(질량 분할, 타입 한정 호출), BM25 + symbol + refs + tree_near + same_file + co-change(E1, `ubis index --git`), 적응형 $K$, 시간 분할 하네스(하네스와 CLI가 같은 hunk→unit 매핑 코드를 쓴다).
+**된 것:** unit 트리와 구조적 ID, gap leaf, SQLite 증거 저장소, 증분 색인, watch, mention→edge 해석(질량 분할, 타입 한정 호출), BM25 + symbol + path(E7) + refs + tree_near + same_file + co-change(E1, `ubis index --git`), 적응형 $K$, 시간 분할 하네스(하네스와 CLI가 같은 hunk→unit 매핑 코드를 쓴다).
 
 **측정으로 확인된 것** (REPORT.md):
+- **PR 태스크(실제 작업 질의)**: `find->near` 2-call이 fd·ripgrep·requests에서 grep → 파일 3개 읽기와 recall 동등 이상, 토큰 1/8~1/22. flask만 0.309 vs 0.327. 남은 실패의 주원인은 설명 어휘 ≠ 코드 어휘(E2 동기).
 - text: fd에서 grep-read@1보다 recall 높고 토큰 1/5. 절대 recall은 낮다(0.25).
 - anchor: 대부분 `tree_near`/`same_file`이 한다. 참조 엣지 기여는 작다(+0.05).
 - `read-anchor-file`(파일 통째)이 recall에서는 아직 이긴다(0.44 vs 0.35, 토큰 약 3배).
@@ -126,10 +128,13 @@ cargo build --release
 - 지금은 최대 낙차 + 질량 50% + $K_{\min}=5$. 대안: 누적 질량 $\tau$만 쓰기, 모드별 $K_{\min}$(identifier 질의 3, anchor 8), 점수 엔트로피 기반.
 - 지표: recall과 read_tok의 파레토 곡선. $K$ 고정 상한과의 격차.
 
+### E7. path operator — **채택됨** (제목 term ↔ 파일 경로, lexical × 0.5)
+### E8. refs 차수 할인 — 기각 (`SPECIFICITY = false`, REPORT.md)
+
 ### E5. Planner 라우팅
 - 질의 형태 판정(식별자형 / 자연어 / anchor 유무)에 따른 $w$ 조정. 한국어 질의, 경로형 질의(`src/..`), 에러 메시지형 질의 규칙 추가.
 
-### E6. 질의원 개선
+### E6. 질의원 개선 — PR 태스크 모드 구현됨 (`--tasks`). 남은 것: 이슈 본문, 테스트 이름 → 구현 unit
 - 커밋 제목 대신 PR 본문, 이슈 제목, 테스트 이름 → 구현 unit, 문서 절 → 식별자 다리 unit 등 더 자연스러운 질의·정답 쌍.
 
 ## 9. 하지 않을 것

@@ -43,6 +43,12 @@ impl UnitKind {
         }
     }
 
+    /// Units whose ID ends in a position (`¶3`, `~2`, `code1`) rather than a
+    /// name, so the ID shifts when text is inserted above them.
+    pub fn is_ordinal(self) -> bool {
+        matches!(self, UnitKind::Paragraph | UnitKind::CodeBlock | UnitKind::Gap)
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "file" => UnitKind::File,

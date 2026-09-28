@@ -317,6 +317,23 @@ mod tests {
         assert_eq!(s.canonical_dump().unwrap(), fresh.canonical_dump().unwrap());
     }
 
+    /// A scope in the title (`printer:`) names a path; among units that match
+    /// the text equally, the one in that path ranks first.
+    #[test]
+    fn path_terms_rank_the_named_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/printer/json.rs", "pub fn finish() { let stats = 1; }\n");
+        write(root, "src/search/core.rs", "pub fn finish() { let stats = 2; }\n");
+        let mut s = Store::open_in_memory().unwrap();
+        index_dir(&mut s, root).unwrap();
+        let hits = ubis_core::search(&s, &ubis_core::Query::text("printer: fix stats in finish"))
+            .unwrap()
+            .hits;
+        assert_eq!(hits[0].id, "src/printer/json.rs::finish");
+        assert!(hits[0].via.iter().any(|v| v.op == "path"));
+    }
+
     #[test]
     fn unchanged_files_are_not_reextracted() {
         let dir = tempfile::tempdir().unwrap();

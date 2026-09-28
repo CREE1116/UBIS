@@ -18,8 +18,19 @@ use crate::tokenize::tokenize;
 
 pub const SCHEMA_VERSION: i64 = 1;
 
-/// `(commit id, unix time, subject, [(path, start line, line count)])`.
-pub type CommitRow = (String, i64, String, Vec<(String, usize, usize)>);
+/// One commit as recorded evidence. `blobs` are the post-commit object ids of
+/// changed paths: content-addressed pointers, so a hunk's file can be re-read
+/// exactly when deriving (e.g. co-change) without storing the content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitRow {
+    pub id: String,
+    pub ts: i64,
+    pub subject: String,
+    /// `(path, start line, line count)` against the post-commit file.
+    pub hunks: Vec<(String, usize, usize)>,
+    /// `(path, blob id)`.
+    pub blobs: Vec<(String, String)>,
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -62,6 +73,8 @@ CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
 CREATE TABLE IF NOT EXISTS commits(id TEXT PRIMARY KEY, ts INTEGER NOT NULL, subject TEXT NOT NULL, seq INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS hunks(commit_id TEXT NOT NULL, path TEXT NOT NULL, start_line INTEGER NOT NULL, len INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS hunks_commit ON hunks(commit_id);
+CREATE TABLE IF NOT EXISTS commit_blobs(commit_id TEXT NOT NULL, path TEXT NOT NULL, blob TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS commit_blobs_commit ON commit_blobs(commit_id);
 CREATE TABLE IF NOT EXISTS cochange(src TEXT NOT NULL, dst TEXT NOT NULL, weight REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS cochange_src ON cochange(src);
 "#;
@@ -271,6 +284,18 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Number of edges into `dst` (how often it is referenced).
+    pub fn in_degree(&self, dst: &str) -> Result<usize> {
+        let mut stmt = self.conn.prepare_cached("SELECT COUNT(*) FROM edges WHERE dst=?1")?;
+        Ok(stmt.query_row([dst], |r| r.get::<_, i64>(0))? as usize)
+    }
+
+    /// Number of edges out of `src` (how many references it makes).
+    pub fn out_degree(&self, src: &str) -> Result<usize> {
+        let mut stmt = self.conn.prepare_cached("SELECT COUNT(*) FROM edges WHERE src=?1")?;
+        Ok(stmt.query_row([src], |r| r.get::<_, i64>(0))? as usize)
+    }
+
     pub fn edges_from(&self, src: &str) -> Result<Vec<Edge>> {
         self.edges_where("src", src)
     }
@@ -419,13 +444,18 @@ impl Store {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM commits", [])?;
         tx.execute("DELETE FROM hunks", [])?;
+        tx.execute("DELETE FROM commit_blobs", [])?;
         {
             let mut c = tx.prepare("INSERT OR REPLACE INTO commits(id, ts, subject, seq) VALUES(?1,?2,?3,?4)")?;
             let mut h = tx.prepare("INSERT INTO hunks(commit_id, path, start_line, len) VALUES(?1,?2,?3,?4)")?;
-            for (seq, (id, ts, subject, hunks)) in commits.iter().enumerate() {
-                c.execute(params![id, ts, subject, seq as i64])?;
-                for (path, start, len) in hunks {
-                    h.execute(params![id, path, *start as i64, *len as i64])?;
+            let mut b = tx.prepare("INSERT INTO commit_blobs(commit_id, path, blob) VALUES(?1,?2,?3)")?;
+            for (seq, c_row) in commits.iter().enumerate() {
+                c.execute(params![c_row.id, c_row.ts, c_row.subject, seq as i64])?;
+                for (path, start, len) in &c_row.hunks {
+                    h.execute(params![c_row.id, path, *start as i64, *len as i64])?;
+                }
+                for (path, blob) in &c_row.blobs {
+                    b.execute(params![c_row.id, path, blob])?;
                 }
             }
         }
@@ -455,6 +485,44 @@ impl Store {
             .prepare_cached("SELECT dst, weight FROM cochange WHERE src=?1 ORDER BY dst")?;
         let rows = stmt.query_map([src], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Recorded history, oldest first.
+    pub fn history(&self) -> Result<Vec<CommitRow>> {
+        let mut out: Vec<CommitRow> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT id, ts, subject FROM commits ORDER BY seq")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)))?;
+            for row in rows {
+                let (id, ts, subject) = row?;
+                index.insert(id.clone(), out.len());
+                out.push(CommitRow { id, ts, subject, hunks: Vec::new(), blobs: Vec::new() });
+            }
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT commit_id, path, start_line, len FROM hunks ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+        })?;
+        for row in rows {
+            let (c, path, start, len) = row?;
+            if let Some(&i) = index.get(&c) {
+                out[i].hunks.push((path, start as usize, len as usize));
+            }
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT commit_id, path, blob FROM commit_blobs ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        for row in rows {
+            let (c, path, blob) = row?;
+            if let Some(&i) = index.get(&c) {
+                out[i].blobs.push((path, blob));
+            }
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------- inspection
