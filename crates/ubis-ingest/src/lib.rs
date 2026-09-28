@@ -378,6 +378,26 @@ mod tests {
         assert!(hits[0].via.iter().any(|v| v.op == "path"));
     }
 
+    /// An index written by another schema/tokenizer version is reset on
+    /// open and refilled by the next index, keeping only the root.
+    #[test]
+    fn old_index_version_is_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", "# A\ntext\n");
+        let db = dir.path().join("x.db");
+        {
+            let mut s = Store::open(&db).unwrap();
+            index_dir(&mut s, dir.path()).unwrap();
+            s.set_meta("root", "/r").unwrap();
+            s.conn().execute("UPDATE meta SET value='0' WHERE key='schema'", []).unwrap();
+        }
+        let mut s = Store::open(&db).unwrap();
+        assert_eq!(s.stats().unwrap().files, 0);
+        assert_eq!(s.meta("root").unwrap().as_deref(), Some("/r"));
+        let r = index_dir(&mut s, dir.path()).unwrap();
+        assert_eq!(r.added, 1);
+    }
+
     #[test]
     fn unchanged_files_are_not_reextracted() {
         let dir = tempfile::tempdir().unwrap();

@@ -44,7 +44,7 @@ Ingest      walker(.gitignore) → 텍스트 판별 → extractor → 파일 단
 
 | Operator | 신호 | 비고 |
 |---|---|---|
-| `lexical` | BM25 (leaf) | 코드 subword 분리, 한글 문자 bigram |
+| `lexical` | BM25 (leaf) | 코드 subword 분리, 영어 어간(Snowball) + 원형, 한글 문자 bigram |
 | `symbol` | 정의 이름 정확 일치, $1/n$ | 식별자 질의에서 강함 |
 | `path` | 질의 첫 줄 term ↔ 파일 경로 토큰(IDF), 상위 5파일의 매칭 leaf | lexical × 0.5. scope(`printer:`)가 경로를 가리킴 |
 | `refs_in` / `refs_out` | anchor로 들어오는/나가는 엣지 질량 | 방향 있음 |

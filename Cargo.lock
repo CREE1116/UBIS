@@ -551,6 +551,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -716,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "ubis-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -730,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "ubis-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -744,10 +754,11 @@ dependencies = [
 
 [[package]]
 name = "ubis-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "rust-stemmers",
  "serde",
  "serde_json",
  "tempfile",
@@ -755,14 +766,14 @@ dependencies = [
 
 [[package]]
 name = "ubis-git"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "ubis-ingest"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",

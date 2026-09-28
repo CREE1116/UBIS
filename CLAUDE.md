@@ -34,7 +34,7 @@ crates/ubis-core/src/
   resolve.rs   mentions ⋈ definitions → edges (same_file > global, Owner::method, bridge ≤3)
   cochange.rs  commits/hunks → co-change 행렬(파생 테이블 `cochange`), CoChange operator
   query.rs     Operator trait, 8개 operator(+path), planner, Stage B/C, adaptive_k
-  tokenize.rs  코드 subword, 한글 bigram
+  tokenize.rs  코드 subword, 영어 어간(+원형), 한글 bigram; tokenize_raw(어간 없음, 채점용)
 crates/ubis-ingest/src/
   lib.rs       admit(텍스트 판별), extract(디스패치), walk, index_dir, index_paths
   history.rs   History(blob 파싱 캐시) / UnitMapper(hunk → 현재 unit), record_and_derive: 이력 기록 → store에서 co-change 파생
@@ -81,7 +81,8 @@ cargo build --release
 **설계 선호: 사용자와 에이전트가 알아야 할 것을 최소로.** 명령 두 개(`find`, `near`)면 되게 한다. 수동 단계(색인)는 자동으로 대체하고, 기각된 실험은 플래그로 남기지 말고 코드에서 지운다(기록은 REPORT.md). 새 인터페이스(MCP 등)는 스킬 + CLI로 안 될 때만.
 
 **측정으로 확인된 것** (REPORT.md):
-- **PR 태스크(실제 작업 질의)**: `find->near` 2-call이 fd·ripgrep·requests에서 grep → 파일 3개 읽기와 recall 동등 이상, 토큰 1/8~1/22. flask만 0.309 vs 0.327. 남은 실패의 주원인은 설명 어휘 ≠ 코드 어휘(E2 동기).
+- **PR 태스크(실제 작업 질의)**: `find->near` 2-call이 네 코퍼스 모두에서 grep → 파일 3개 읽기보다 recall이 높다(fd 0.414 vs 0.373, ripgrep 0.345 vs 0.250, requests 0.380 vs 0.278, flask 0.343 vs 0.327), 토큰 1/8~1/20. 어형 불일치는 어간 추출(E10)로 줄었고, 남은 어휘 불일치(다른 단어)는 E2 대상.
+- **채점은 고정:** 벤치의 정답 매핑과 grep baseline은 `tokenize_raw`. 검색 쪽 토크나이저를 바꿔도 정답 집합이 움직이지 않는다.
 - text: fd에서 grep-read@1보다 recall 높고 토큰 1/5. 절대 recall은 낮다(0.25).
 - anchor: 대부분 `tree_near`/`same_file`이 한다. 참조 엣지 기여는 작다(+0.05).
 - `read-anchor-file`(파일 통째)이 recall에서는 아직 이긴다(0.44 vs 0.35, 토큰 약 3배).

@@ -16,7 +16,9 @@ use crate::model::*;
 use crate::resolve;
 use crate::tokenize::tokenize;
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// Bump when stored rows would differ for the same input (schema or
+/// tokenizer changes); older indexes are then reset and rebuilt.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// One commit as recorded evidence. `blobs` are the post-commit object ids of
 /// changed paths: content-addressed pointers, so a hunk's file can be re-read
@@ -153,10 +155,25 @@ impl Store {
                     [SCHEMA_VERSION.to_string()],
                 )?;
             }
-            Some(v) => anyhow::ensure!(
-                v == SCHEMA_VERSION.to_string(),
-                "index schema {v} is not supported (expected {SCHEMA_VERSION}); delete the index and rebuild"
-            ),
+            Some(v) if v == SCHEMA_VERSION.to_string() => {}
+            Some(_) => {
+                // Everything here is rebuilt from the files and git, so an
+                // index from another version is reset instead of refused; the
+                // next index or refresh fills it again. Only `root` is kept.
+                let tables: Vec<String> = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name != 'meta'")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                for t in tables {
+                    conn.execute_batch(&format!("DROP TABLE \"{t}\""))?;
+                }
+                conn.execute("DELETE FROM meta WHERE key != 'root'", [])?;
+                conn.execute_batch(SCHEMA)?;
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('schema', ?1)",
+                    [SCHEMA_VERSION.to_string()],
+                )?;
+            }
         }
         Ok(Self { conn })
     }

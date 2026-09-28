@@ -29,7 +29,7 @@ use clap::Parser;
 use serde::Serialize;
 use ubis_core::cochange::CoChangeParams;
 use ubis_core::query::{plan, search_with, Query};
-use ubis_core::tokenize::tokenize;
+use ubis_core::tokenize::tokenize_raw as tokenize;
 use ubis_core::Store;
 use ubis_ingest::history::History;
 

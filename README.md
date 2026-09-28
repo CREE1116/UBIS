@@ -278,7 +278,7 @@ flowchart TB
 
 | Operator | 신호 | 기본 가중치 |
 |---|---|---|
-| `lexical` | BM25 (코드 subword 분리, 한글 bigram) | 1.0 / anchor 있으면 0.25 |
+| `lexical` | BM25 (코드 subword 분리, 영어 어간 + 원형, 한글 bigram) | 1.0 / anchor 있으면 0.25 |
 | `symbol` | 정의 이름 정확 일치, $1/n$ | 식별자형 1.2 / 자연어 0.3 / anchor 0.25 |
 | `path` | 제목 term ↔ 파일 경로 토큰 (IDF), 그 파일의 매칭 leaf | lexical × 0.5 |
 | `refs_in` · `refs_out` | anchor로 들어오는/나가는 엣지 질량 | 0.8 |
@@ -319,12 +319,12 @@ flowchart LR
 
 | 코퍼스 (태스크 수) | grep → 파일 3개 읽기 | **ubis find→near** | 토큰 비율 |
 |---|---:|---:|---:|
-| sharkdp/fd (67) | 0.373 / 24,304 tok | **0.385** / 2,940 tok | 1/8 |
-| BurntSushi/ripgrep (178) | 0.250 / 59,062 tok | **0.287** / 3,394 tok | 1/17 |
-| psf/requests (114) | 0.278 / 41,214 tok | **0.345** / 1,908 tok | 1/22 |
-| pallets/flask (140) | 0.327 / 35,673 tok | 0.309 / 2,101 tok | 1/17 |
+| sharkdp/fd (67) | 0.373 / 24,304 tok | **0.414** / 2,957 tok | 1/8 |
+| BurntSushi/ripgrep (178) | 0.250 / 59,062 tok | **0.345** / 3,368 tok | 1/18 |
+| psf/requests (114) | 0.278 / 41,214 tok | **0.380** / 2,018 tok | 1/20 |
+| pallets/flask (140) | 0.327 / 35,673 tok | **0.343** / 2,153 tok | 1/17 |
 
-recall = PR이 바꾼 unit 중 찾은 비율. 네 개 중 세 코퍼스에서 grep+파일 읽기보다 많이 찾으면서 토큰은 1/8~1/22.
+recall = PR이 바꾼 unit 중 찾은 비율. 네 코퍼스 모두에서 grep+파일 읽기보다 많이 찾으면서 토큰은 1/8~1/20.
 
 ```bash
 python3 crates/ubis-bench/scripts/fetch_pr_tasks.py sharkdp/fd path/to/fd tasks.jsonl   # gh 필요

@@ -200,3 +200,36 @@ text(1 call) recall: fd 0.370→0.366, ripgrep 0.157→0.238, requests 0.239→0
 **외부 몫 — 채택(정합성).** 수신 타입을 모르는 호출(`x.len()`, Python `obj.f()`, Java `x.f()`)을 새 mention 종류 `method`로 기록하고, 후보 $m$개에 "프로젝트 밖" 1개를 더해 $1/(m+1)$씩 나눈다. 원칙 4(모호함은 질량으로)를 그대로 적용한 것이다. 벤치 영향은 중립이다: 커밋 모드 anchor+text fd 0.452→0.457, ripgrep 0.295→0.302, 나머지 ±0.002. PR 태스크 동일(ripgrep anchor+text 0.350→0.348). 회귀 없이 잘못된 확정 엣지를 줄이므로 채택.
 
 **noisy-OR — 기각.** 위 수정 후에도 `resolve_unit`의 `.iter()` 두 번이 0.5+0.5=1.0으로 합산되어 확정 참조와 동률이었다. 같은 엣지의 여러 mention을 $1-\prod(1-w_i)$로 합치면 [0,1] 확률처럼 된다. 결과: ripgrep anchor +0.012(커밋·PR 모두), PR 태스크 ripgrep anchor+text **−0.025**, 나머지 동일. 기준 미달로 기각하고 코드에서 제거했다. 합산은 "여러 번 부르는 대상이 더 관련 있다"는 신호도 담고 있어서, 이를 버리면 anchor+text에서 손해를 보는 것으로 보인다.
+
+## E10: 어간 추출(Snowball English) — 채택 (v0.4)
+
+- **가설:** 남은 실패의 다수가 어형 불일치다(flask: "autoescape **selection**" ↔ `select_jinja_autoescape`, "rout**ing**" ↔ `route`). 학습 없는 결정론적 어간 추출로 잇는다(E2 공출현 확장보다 싸다).
+- **정의:** 순수 알파벳 소문자 term(길이 ≥ 4)에 Snowball English 어간을 **추가**한다(원형 + 어간, 다를 때만). 정확히 같은 형태는 두 term 모두 맞아 더 높게, 어형만 다르면 어간으로 만난다. `_`·숫자가 있는 식별자 전체와 한글 bigram은 그대로. 색인·질의·`path` operator가 같은 토크나이저를 쓴다.
+- **어간만 두기(원형 제거)는 기각:** PR 태스크 fd text −0.030, find->near −0.017.
+- **채점 분리:** 벤치의 정답 매핑(서수 unit Jaccard)과 grep 비교군은 `tokenize_raw`(어간 없음)를 쓴다. 처음 측정에서는 채점도 같은 토크나이저를 써서 정답 집합과 baseline이 함께 움직였다(fd 커밋 n 106→107, grep@3 0.452→0.375). 평가 대상을 바꿀 때 채점이 움직이지 않게 고정했다. `raw_has_no_stems` 테스트로 막는다.
+
+PR 태스크 (정답·baseline은 v0.3과 동일):
+
+| corpus (n) | grep-read@3 | v0.3 text / find->near | **v0.4 text / find->near** |
+|---|---:|---:|---:|
+| fd (67) | 0.373 | 0.366 / 0.385 | **0.376 / 0.414** |
+| ripgrep (178) | 0.250 | 0.238 / 0.287 | **0.297 / 0.345** |
+| requests (114) | 0.278 | 0.305 / 0.345 | **0.339 / 0.380** |
+| flask (140) | 0.327 | 0.270 / 0.309 | **0.311 / 0.343** |
+
+네 코퍼스 모두 find->near +0.029~+0.058. **처음으로 네 코퍼스 모두에서 grep → 파일 3개 읽기보다 recall이 높다**(토큰 1/8~1/20). anchor+text: fd 0.317→0.314, ripgrep 0.348→0.340, requests 0.348→0.351, flask 0.172→0.189.
+
+커밋 제목 모드 (n 동일)는 섞인다 — 기록해 둔다:
+
+| corpus | text | find->near | anchor+text |
+|---|---:|---:|---:|
+| fd (106/60) | 0.272→0.264 | 0.334→**0.310** | 0.457→0.454 |
+| requests (56/20) | 0.181→0.196 | 0.203→0.228 | 0.343→0.321 |
+| ripgrep (178/81) | 0.316→0.314 | 0.366→0.360 | 0.302→0.310 |
+| flask (74/30) | 0.225→0.214 | 0.266→**0.214** | 0.469→**0.408** |
+
+flask 커밋 모드의 뒤집힌 질의는 "fix grammar", "update requirements", "remove unused module docstrings" 같은 모호한 제목에서 양방향이다(n=74, anchor+text n=30은 질의 2개 차이). 주 지표(PR 태스크, 질의 499개)에서 네 코퍼스 모두 이겨 채택했다.
+
+- **비용:** ripgrep 전체 색인 1.17s → 1.36s(+16%, postings 증가).
+- **색인 호환:** 토크나이저가 바뀌면 저장된 postings와 질의가 어긋난다. `SCHEMA_VERSION` 2로 올리고, 다른 버전의 인덱스는 **열 때 자동 초기화**(파일과 git에서 다시 만들어지므로 `root`만 유지). 사용자가 인덱스를 지울 필요가 없다. 테스트 `old_index_version_is_rebuilt`.
+- **Dogfooding:** 어휘 불일치로 실패했던 "reparse cache for historical file versions…"가 이제 1위에 맞는 파일(`history.rs`)을 낸다(수정 위치 `UnitMapper`는 같은 파일, `near`로 도달).

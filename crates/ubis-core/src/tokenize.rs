@@ -2,6 +2,9 @@
 //!
 //! * Latin/ASCII words: the lowercased word plus its `snake_case` and
 //!   `camelCase` parts (`HnswIndex` → `hnswindex`, `hnsw`, `index`).
+//!   Purely alphabetic terms are reduced to their English stem (Snowball),
+//!   so `selection` meets `select` and `routing` meets `route`. Whole
+//!   identifiers with `_` or digits are kept verbatim.
 //! * Hangul and CJK runs: character bigrams, so that `검색은` matches `검색`
 //!   without a morphological analyzer. A single-character run is kept whole.
 
@@ -35,13 +38,23 @@ pub fn is_cjk(c: char) -> bool {
 /// Tokenize text into index terms. Order follows the text; duplicates are kept
 /// so that term frequency can be counted by the caller.
 pub fn tokenize(text: &str) -> Vec<String> {
+    tokenize_with(text, true)
+}
+
+/// Surface forms only, no stems. For judging and baselines (gold mapping,
+/// grep), which must not move when retrieval's tokenization changes.
+pub fn tokenize_raw(text: &str) -> Vec<String> {
+    tokenize_with(text, false)
+}
+
+fn tokenize_with(text: &str, stems: bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut run = String::new();
     let mut run_class = Class::Other;
     for c in text.chars() {
         let k = class(c);
         if k != run_class && !run.is_empty() {
-            flush(&run, run_class, &mut out);
+            flush(&run, run_class, stems, &mut out);
             run.clear();
         }
         run_class = k;
@@ -50,14 +63,14 @@ pub fn tokenize(text: &str) -> Vec<String> {
         }
     }
     if !run.is_empty() {
-        flush(&run, run_class, &mut out);
+        flush(&run, run_class, stems, &mut out);
     }
     out
 }
 
-fn flush(run: &str, class: Class, out: &mut Vec<String>) {
+fn flush(run: &str, class: Class, stems: bool, out: &mut Vec<String>) {
     match class {
-        Class::Word => word_terms(run, out),
+        Class::Word => word_terms(run, stems, out),
         Class::Cjk => {
             let chars: Vec<char> = run.chars().collect();
             if chars.len() == 1 {
@@ -72,7 +85,7 @@ fn flush(run: &str, class: Class, out: &mut Vec<String>) {
     }
 }
 
-fn word_terms(word: &str, out: &mut Vec<String>) {
+fn word_terms(word: &str, stems: bool, out: &mut Vec<String>) {
     let trimmed = word.trim_matches('_');
     if trimmed.is_empty() {
         return;
@@ -80,15 +93,39 @@ fn word_terms(word: &str, out: &mut Vec<String>) {
     let full = trimmed.to_lowercase();
     let parts = split_identifier(trimmed);
     if full.chars().count() >= 2 {
-        out.push(full.clone());
+        push_with_stem(&full, stems, out);
     }
     if parts.len() > 1 {
         for p in parts {
             if p.chars().count() >= 2 && p != full {
-                out.push(p);
+                push_with_stem(&p, stems, out);
             }
         }
     }
+}
+
+/// The term itself, plus its stem when that differs: an exact form matches
+/// twice (form and stem), an inflected form still meets through the stem.
+fn push_with_stem(term: &str, stems: bool, out: &mut Vec<String>) {
+    if stems {
+        let s = stem(term);
+        if s != term {
+            out.push(s);
+        }
+    }
+    out.push(term.to_string());
+}
+
+/// English stem of a lowercase, purely alphabetic ASCII term; anything else
+/// (identifiers with `_` or digits, non-Latin) is returned unchanged.
+pub fn stem(term: &str) -> String {
+    use std::sync::OnceLock;
+    static STEMMER: OnceLock<rust_stemmers::Stemmer> = OnceLock::new();
+    if term.len() < 4 || !term.bytes().all(|b| b.is_ascii_lowercase()) {
+        return term.to_string();
+    }
+    let s = STEMMER.get_or_init(|| rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English));
+    s.stem(term).into_owned()
 }
 
 /// Split an identifier on `_` and case boundaries, lowercased.
@@ -167,5 +204,11 @@ mod tests {
         assert!(is_identifier_shaped("Store::open"));
         assert!(!is_identifier_shaped("Search"));
         assert!(!is_identifier_shaped("index"));
+    }
+
+    #[test]
+    fn raw_has_no_stems() {
+        assert!(tokenize("selection routing").contains(&"select".to_string()));
+        assert_eq!(tokenize_raw("selection routing"), vec!["selection", "routing"]);
     }
 }

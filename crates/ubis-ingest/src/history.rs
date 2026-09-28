@@ -23,7 +23,7 @@ use std::rc::Rc;
 use anyhow::Result;
 use ubis_core::cochange::{CoChangeIndex, CoChangeParams};
 use ubis_core::model::UnitId;
-use ubis_core::tokenize::tokenize;
+use ubis_core::tokenize::tokenize_raw as tokenize;
 use ubis_core::store::CommitRow;
 use ubis_core::Store;
 use ubis_git::{BlobReader, Commit};
