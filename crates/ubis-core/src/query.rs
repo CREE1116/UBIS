@@ -27,6 +27,9 @@ pub struct Query {
     /// Restrict results to paths with this prefix.
     pub scope: Option<String>,
     pub k_max: usize,
+    /// Lower bound of the adaptive cut. `None` uses [`K_MIN`]; `Some(k_max)`
+    /// disables the adaptive cut.
+    pub k_min: Option<usize>,
 }
 
 impl Query {
@@ -36,6 +39,7 @@ impl Query {
             anchor: None,
             scope: None,
             k_max: 10,
+            k_min: None,
         }
     }
 }
@@ -245,6 +249,33 @@ impl Operator for TreeNear {
     }
 }
 
+/// Other leaves in the anchor's file, closer in document order scores higher.
+/// Much co-change is intra-file; this reaches it at unit granularity instead
+/// of reading the whole file.
+pub struct SameFile {
+    pub limit: usize,
+}
+
+impl Operator for SameFile {
+    fn name(&self) -> &'static str {
+        "same_file"
+    }
+    fn generate(&self, store: &Store, _q: &Query, ctx: &Context) -> Result<Vec<(UnitId, f64)>> {
+        let Some(anchor) = &ctx.anchor else {
+            return Ok(Vec::new());
+        };
+        let mut scores = HashMap::new();
+        for u in store.units_in_file(&anchor.path)? {
+            if !u.is_leaf || ctx.anchor_set.contains(&u.id) {
+                continue;
+            }
+            let d = (u.ord - anchor.ord).unsigned_abs() as f64;
+            scores.insert(u.id, 1.0 / (1.0 + d / 4.0));
+        }
+        Ok(top(scores, self.limit))
+    }
+}
+
 fn top(scores: HashMap<UnitId, f64>, limit: usize) -> Vec<(UnitId, f64)> {
     let mut v: Vec<_> = scores.into_iter().filter(|(_, s)| *s > 0.0).collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -279,6 +310,7 @@ pub fn plan(q: &Query) -> Plan {
         ops.push((Box::new(RefsIn { limit: 50 }), 0.8));
         ops.push((Box::new(RefsOut { limit: 50 }), 0.8));
         ops.push((Box::new(TreeNear { limit: 30 }), 0.3));
+        ops.push((Box::new(SameFile { limit: 30 }), 0.2));
     }
     Plan { ops }
 }
@@ -287,7 +319,9 @@ pub fn plan(q: &Query) -> Plan {
 
 pub const LIFT_MIN_SIBLINGS: usize = 4;
 pub const LIFT_MAX_LINES: usize = 300;
-pub const K_MIN: usize = 3;
+/// Floor of the adaptive cut. Measured with ubis-bench: 3 cut anchor queries
+/// too early (fd anchor recall 0.322 → 0.351 at 5), and candidates are cheap.
+pub const K_MIN: usize = 5;
 pub const MASS_TAU: f64 = 0.5;
 
 pub fn search(store: &Store, q: &Query) -> Result<Response> {
@@ -344,7 +378,8 @@ pub fn search_with(store: &Store, q: &Query, plan: Plan) -> Result<Response> {
     // Stage C.
     let ranked = collapse_ancestors(store, ranked)?;
     let ranked = lift_siblings(store, ranked, q.k_max)?;
-    let k = adaptive_k(&ranked.iter().map(|r| r.1).collect::<Vec<_>>(), q.k_max);
+    let scores: Vec<f64> = ranked.iter().map(|r| r.1).collect();
+    let k = adaptive_k_range(&scores, q.k_min.unwrap_or(K_MIN), q.k_max);
 
     let hits = ranked
         .into_iter()
@@ -455,11 +490,15 @@ fn lift_siblings(store: &Store, ranked: Ranked, k_max: usize) -> Result<Ranked> 
 /// Cut at the largest score drop within `[K_MIN, k_max]`, subject to keeping
 /// at least `MASS_TAU` of the score mass of the top `k_max`.
 pub fn adaptive_k(scores: &[f64], k_max: usize) -> usize {
+    adaptive_k_range(scores, K_MIN, k_max)
+}
+
+pub fn adaptive_k_range(scores: &[f64], k_min: usize, k_max: usize) -> usize {
     let hi = k_max.min(scores.len());
     if hi == 0 {
         return 0;
     }
-    let lo = K_MIN.min(hi);
+    let lo = k_min.clamp(1, hi);
     let mass: f64 = scores[..hi].iter().sum();
     let mut best = hi;
     let mut best_gap = f64::NEG_INFINITY;
@@ -487,10 +526,12 @@ mod tests {
 
     #[test]
     fn adaptive_k_cuts_at_largest_gap() {
-        assert_eq!(adaptive_k(&[1.0, 0.95, 0.9, 0.2, 0.1], 10), 3);
-        assert_eq!(adaptive_k(&[1.0, 0.1, 0.09], 10), 3); // K_MIN floor
+        let s = [1.0, 0.95, 0.9, 0.2, 0.1, 0.05];
+        assert_eq!(adaptive_k_range(&s, 3, 10), 3);
+        assert_eq!(adaptive_k_range(&[1.0, 0.1, 0.09], 3, 10), 3); // floor
         assert_eq!(adaptive_k(&[1.0; 20], 10), 10); // flat: take everything allowed
         assert_eq!(adaptive_k(&[], 10), 0);
+        assert_eq!(adaptive_k_range(&s, 10, 10), 6); // floor = max disables the cut
     }
 
     #[test]

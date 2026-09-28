@@ -42,6 +42,9 @@ struct Args {
     /// Result budget per query.
     #[arg(short, long, default_value_t = 10)]
     k: usize,
+    /// Lower bound of the adaptive cut (set equal to -k to disable the cut).
+    #[arg(long)]
+    k_min: Option<usize>,
     /// Skip commits touching more units than this (bulk edits).
     #[arg(long, default_value_t = 40)]
     max_gold: usize,
@@ -154,6 +157,7 @@ fn main() -> Result<()> {
                 anchor: None,
                 scope: None,
                 k_max: args.k,
+                k_min: args.k_min,
             };
             let (r, n, t) = run(&store, &q, &gold, &args)?;
             aggs.entry("ubis text").or_default().add(r, n, t);
@@ -177,6 +181,7 @@ fn main() -> Result<()> {
                     anchor: Some(anchor.clone()),
                     scope: None,
                     k_max: args.k,
+                k_min: args.k_min,
                 };
                 let (r, n, t) = run(&store, &q, &rest, &args)?;
                 aggs.entry(name).or_default().add(r, n, t);

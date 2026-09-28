@@ -36,6 +36,14 @@ enum Cmd {
         #[arg(long)]
         git: bool,
     },
+    /// Index, then keep the index current from filesystem events.
+    Watch {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Quiet period before a batch of events is applied.
+        #[arg(long, default_value_t = 300)]
+        debounce_ms: u64,
+    },
     /// Find candidate units for a description, optionally from an anchor unit.
     Find {
         /// Query text (may be empty when --anchor is given).
@@ -72,6 +80,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
         Cmd::Index { path, git } => cmd_index(&cli, path, *git),
+        Cmd::Watch { path, debounce_ms } => cmd_watch(&cli, path, *debounce_ms),
         Cmd::Find { text, anchor, scope, k } => {
             let store = open_store(&cli)?;
             let q = Query {
@@ -79,6 +88,7 @@ fn main() -> Result<()> {
                 anchor: anchor.clone(),
                 scope: scope.clone(),
                 k_max: *k,
+                k_min: None,
             };
             if q.text.trim().is_empty() && q.anchor.is_none() {
                 bail!("give query text, --anchor, or both");
@@ -93,6 +103,7 @@ fn main() -> Result<()> {
                 anchor: Some(u.id),
                 scope: None,
                 k_max: *k,
+                k_min: None,
             };
             print_hits(&cli, &search(&store, &q)?.hits)
         }
@@ -195,6 +206,75 @@ fn cmd_index(cli: &Cli, path: &Path, git: bool) -> Result<()> {
         println!("db: {}", db.display());
     }
     Ok(())
+}
+
+fn cmd_watch(cli: &Cli, path: &Path, debounce_ms: u64) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+    use std::collections::BTreeSet;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let root = path
+        .canonicalize()
+        .with_context(|| format!("{} does not exist", path.display()))?;
+    let db = cli.db.clone().unwrap_or_else(|| root.join(DB_DIR).join(DB_FILE));
+    let mut store = Store::open(&db)?;
+    let r = ubis_ingest::index_dir(&mut store, &root)?;
+    println!(
+        "watching {} — initial: added {}, updated {}, removed {}; edges {}",
+        root.display(),
+        r.added,
+        r.updated,
+        r.removed,
+        r.edges
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res {
+            let _ = tx.send(ev.paths);
+        }
+    })?;
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+    let db_dir = db.parent().map(Path::to_path_buf);
+
+    loop {
+        let first = rx.recv().context("watcher stopped")?;
+        let mut paths = first;
+        while let Ok(more) = rx.recv_timeout(Duration::from_millis(debounce_ms)) {
+            paths.extend(more);
+        }
+        let changed: BTreeSet<String> = paths
+            .into_iter()
+            .filter(|p| db_dir.as_ref().is_none_or(|d| !p.starts_with(d)))
+            .filter_map(|p| {
+                p.strip_prefix(&root).ok().map(|rel| {
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+            })
+            .filter(|rel| !rel.is_empty())
+            .collect();
+        if changed.is_empty() {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        match ubis_ingest::index_paths(&mut store, &root, &changed) {
+            Ok(r) if r.added + r.updated + r.removed > 0 => println!(
+                "{} path(s) → added {}, updated {}, removed {}; edges {} ({} ms)",
+                changed.len(),
+                r.added,
+                r.updated,
+                r.removed,
+                r.edges,
+                started.elapsed().as_millis()
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("update failed: {e:#}"),
+        }
+    }
 }
 
 fn open_store(cli: &Cli) -> Result<Store> {

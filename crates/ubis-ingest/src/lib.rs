@@ -159,6 +159,80 @@ pub fn index_dir(store: &mut Store, root: &Path) -> Result<IndexReport> {
     Ok(report)
 }
 
+/// Re-index only the given relative paths (files or directories), as a file
+/// watcher would. Equivalent to [`index_dir`] when `changed` covers every
+/// path that actually changed; paths under a changed directory are included.
+pub fn index_paths(store: &mut Store, root: &Path, changed: &BTreeSet<String>) -> Result<IndexReport> {
+    let mut report = IndexReport::default();
+    let allowed: BTreeSet<String> = walk(root).into_iter().collect();
+    let known: BTreeSet<String> = store.file_paths()?.into_iter().collect();
+    let under = |set: &BTreeSet<String>, c: &str| -> Vec<String> {
+        let prefix = format!("{c}/");
+        set.range(prefix.clone()..)
+            .take_while(|p| p.starts_with(&prefix))
+            .cloned()
+            .collect()
+    };
+    let mut targets = BTreeSet::new();
+    for c in changed {
+        let c = c.trim_end_matches('/');
+        targets.insert(c.to_string());
+        targets.extend(under(&allowed, c));
+        targets.extend(under(&known, c));
+    }
+    for rel in targets {
+        let is_known = known.contains(&rel);
+        if !allowed.contains(&rel) {
+            if is_known {
+                store.remove_file(&rel)?;
+                report.removed += 1;
+            }
+            continue;
+        }
+        report.scanned += 1;
+        let abs = root.join(&rel);
+        let content = std::fs::read(&abs).ok().and_then(|b| admit(&abs, &b).map(|c| (c, b.len())));
+        let Some((content, size)) = content else {
+            if is_known {
+                store.remove_file(&rel)?;
+                report.removed += 1;
+            } else {
+                report.skipped += 1;
+            }
+            continue;
+        };
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        if store.file_hash(&rel)?.as_deref() == Some(hash.as_str()) {
+            report.unchanged += 1;
+            continue;
+        }
+        match extract(&rel, &content) {
+            Ok(ex) => {
+                store.replace_file(&ex, &hash, size as u64)?;
+                if is_known {
+                    report.updated += 1;
+                } else {
+                    report.added += 1;
+                }
+            }
+            Err(_) => {
+                if is_known {
+                    store.remove_file(&rel)?;
+                    report.removed += 1;
+                } else {
+                    report.skipped += 1;
+                }
+            }
+        }
+    }
+    if report.added + report.updated + report.removed > 0 {
+        report.edges = store.rebuild_edges()?;
+    } else {
+        report.edges = store.stats()?.edges;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +289,31 @@ mod tests {
         // Final state sanity: the doc bridges to `caller`.
         let e = inc.edges_to("src/b.rs::caller").unwrap();
         assert!(e.iter().any(|e| e.src.starts_with("docs/guide.md")));
+    }
+
+    /// Watcher path: updating only the touched paths (including a directory
+    /// rename) matches a fresh index.
+    #[test]
+    fn index_paths_equals_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/a.rs", "pub fn helper() {}\n");
+        write(root, "src/b.rs", "pub fn run() { helper(); }\n");
+        write(root, "docs/x/n.md", "# N\nUses `helper`.\n");
+        let mut s = Store::open_in_memory().unwrap();
+        index_dir(&mut s, root).unwrap();
+
+        write(root, "src/a.rs", "pub fn helper2() {}\npub fn helper() {}\n");
+        std::fs::rename(root.join("docs/x"), root.join("docs/y")).unwrap();
+        write(root, "new.txt", "fresh file mentioning run_it\n");
+        let changed: BTreeSet<String> =
+            ["src/a.rs", "docs/x", "docs/y", "new.txt"].iter().map(|s| s.to_string()).collect();
+        let r = index_paths(&mut s, root, &changed).unwrap();
+        assert_eq!((r.added, r.updated, r.removed), (2, 1, 1));
+
+        let mut fresh = Store::open_in_memory().unwrap();
+        index_dir(&mut fresh, root).unwrap();
+        assert_eq!(s.canonical_dump().unwrap(), fresh.canonical_dump().unwrap());
     }
 
     #[test]

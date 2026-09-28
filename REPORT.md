@@ -41,6 +41,36 @@
 - **`read-anchor-file`이 recall에서 이긴다**(0.437 vs 0.322, 토큰 3.5배). anchor 모드의 적응형 컷이 너무 이르게 자르는 것(평균 2.5개)이 한 원인으로 보인다. 다음 실험 대상.
 - **anchor + 텍스트 가중치**: 텍스트를 1.0으로 두면 anchor 신호가 묻혔다(fd 0.254, requests 0.157). 0.25로 낮춰 fd 0.320 / requests 0.307. 이 값이 현재 planner 기본값이다.
 
+## 변경 2: `same_file` operator, $K_{\min}=5$
+
+anchor 모드가 평균 2.5개만 반환하고 `read-anchor-file`에 recall로 크게 졌다. 원인은 두 가지: 후보가 형제로만 제한됐고, 적응형 컷 하한(3)이 너무 낮았다.
+
+| fd | 기존 | `same_file` 추가 | + $K_{\min}=5$ | ($K$=10 고정, 상한 참고) |
+|---|---:|---:|---:|---:|
+| anchor recall | 0.322 | 0.322 | **0.351** | 0.368 |
+| anchor+text recall | 0.320 | 0.325 | **0.336** | 0.384 |
+| text recall | 0.253 | 0.253 | 0.253 | 0.305 |
+
+| requests (n=20, 잡음 큼) | 기존 | 현재 기본값 |
+|---|---:|---:|
+| anchor recall | 0.264 | 0.236 |
+| anchor+text recall | 0.307 | **0.393** |
+| text recall | 0.154 | 0.154 |
+
+현재 기본값 전체 표 (fd / requests):
+
+| method | fd recall | fd read_tok | requests recall | requests read_tok |
+|---|---:|---:|---:|---:|
+| grep-read@1 text | 0.135 | 5806 | 0.244 | 12755 |
+| grep-read@3 text | 0.452 | 16489 | 0.469 | 32586 |
+| read-anchor-file | 0.437 | 3191 | 0.464 | 5254 |
+| ubis anchor | 0.351 | 1135 | 0.236 | 1034 |
+| ubis anchor+text | 0.336 | 1261 | 0.393 | 889 |
+| ubis text | 0.253 | 1282 | 0.154 | 665 |
+
+- requests anchor-only가 0.264→0.236으로 내려갔다. 질의 20개라 한두 개 차이다. 코퍼스를 늘려야 판단할 수 있다.
+- $K$=10 고정이 recall은 더 높다. 적응형 컷이 recall을 깎는 대신 토큰을 아낀다. 이 교환비를 어디에 둘지는 실제 에이전트 사용으로 정해야 한다.
+
 ## 다음 측정
 
 1. anchor 모드 $K_{\min}$과 컷 규칙 조정 → `read-anchor-file`과의 recall 격차

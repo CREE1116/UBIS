@@ -45,10 +45,11 @@ Ingest      walker(.gitignore) → 텍스트 판별 → extractor → 파일 단
 | `symbol` | 정의 이름 정확 일치, $1/n$ | 식별자 질의에서 강함 |
 | `refs_in` / `refs_out` | anchor로 들어오는/나가는 엣지 질량 | 방향 있음 |
 | `tree_near` | anchor 형제, 문서 순서 거리 $1/(1+d)$ | |
+| `same_file` | anchor 파일의 다른 leaf, $1/(1+d/4)$ | 파일 내부 co-change를 unit 단위로 |
 
 - **Planner**: 식별자형 질의 → `symbol` 가중; anchor 있음 → 관계 operator + 텍스트는 0.25로 낮춤(하네스로 측정해 정함).
 - **Stage B**: $\phi_f = \text{raw}_f/\max\text{raw}_f$, $s=\sum_f w_f\phi_f$. 점수 간격을 보존해야 적응형 $K$가 의미 있다.
-- **Stage C**: (1) 조상·자손이 함께 뜨면 자손만 남김 (2) 작은 부모(≤300줄) 밑 형제가 4개 이상이면 부모 하나로 올림 (3) $K\in[3,K_{\max}]$에서 최대 점수 낙차 지점, 단 상위 $K_{\max}$ 질량의 50% 이상 유지, 동률이면 큰 $K$.
+- **Stage C**: (1) 조상·자손이 함께 뜨면 자손만 남김 (2) 작은 부모(≤300줄) 밑 형제가 4개 이상이면 부모 하나로 올림 (3) $K\in[5,K_{\max}]$에서 최대 점수 낙차 지점, 단 상위 $K_{\max}$ 질량의 50% 이상 유지, 동률이면 큰 $K$.
 
 ## 평가 (ubis-bench)
 
@@ -73,4 +74,4 @@ git은 증거이자 채점자라서 **시간으로 자른다**. $T_0$ 시점 트
 3. **relation factor**: $X_t\approx U S V^\top$, $u=S^{1/2}U$(바라봄), $v=S^{1/2}V$(바라봐짐). $s(A\to B)=\langle u_A,v_B\rangle$. co-citation은 EASE 형태
    $B_{ij}=\langle a_i,a_j\rangle/(1-\lVert a_j\rVert^2)$, $a=\mathrm{diag}\big(\sqrt{\lambda_k/(\lambda_k+\lambda)}\big)V^\top$ (정확한 등식).
 4. **Unit Diff**: 재색인 시 서수 unit ID 승계.
-5. **watch**: 파일 이벤트 → 해당 파일만 교체 + 엣지 재유도.
+5. ~~watch~~: 구현됨 (`ubis watch`, `index_paths`). 엣지는 아직 전체 재유도 — 이름 변화 집합 $N_\Delta$에 대한 mention만 재해석하는 증분 resolver가 다음 단계.

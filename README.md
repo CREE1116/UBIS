@@ -28,6 +28,7 @@ cargo install --path crates/ubis-cli        # `ubis`
 cargo install --path crates/ubis-bench      # `ubis-bench`
 
 ubis index .                  # 증분 색인 (.ubis/index.db). 바뀐 파일만 재추출
+ubis watch .                  # 색인 후 파일 이벤트로 계속 갱신 (바뀐 경로만)
 ubis find "토큰 만료 처리"      # 텍스트 → 후보 unit
 ubis find --anchor Store::open "error handling"   # anchor + 텍스트
 ubis near Store::open         # anchor만: 참조하는 곳, 참조되는 곳, 형제
