@@ -774,6 +774,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "ubis-core",
+ "ubis-git",
 ]
 
 [[package]]

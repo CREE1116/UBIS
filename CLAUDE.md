@@ -32,16 +32,18 @@ crates/ubis-core/src/
   model.rs     Unit, Definition, Mention, Edge, Extracted (extractor 출력 계약)
   store.rs     SQLite 스키마, 파일 단위 교체, canonical_dump (동등성 테스트용)
   resolve.rs   mentions ⋈ definitions → edges (same_file > global, Owner::method, bridge ≤3)
-  query.rs     Operator trait, 5개 operator, planner, Stage B/C, adaptive_k
+  cochange.rs  commits/hunks → co-change 행렬(파생 테이블 `cochange`), CoChange operator
+  query.rs     Operator trait, 7개 operator, planner, Stage B/C, adaptive_k
   tokenize.rs  코드 subword, 한글 bigram
 crates/ubis-ingest/src/
   lib.rs       admit(텍스트 판별), extract(디스패치), walk, index_dir, index_paths
+  history.rs   UnitMapper: 커밋 hunk → 현재 unit (blob 캐시, 서수 unit Jaccard), rebuild_cochange
   tree.rs      UnitTree: ID 중복 처리, gap leaf, leaf/컨테이너 텍스트 규칙
   code.rs      tree-sitter Rust/Python/Java
   markdown.rs  heading 계층, GitHub anchor, 링크, 위키 링크
   text.rs      문단 + bridge
   prose.rs     bridge mention 추출, 문단 분할
-crates/ubis-git/   git log -p --unified=0 파싱, show, archive
+crates/ubis-git/   git log -p --raw --unified=0 파싱(hunk + blob id), BlobReader(cat-file --batch), archive
 crates/ubis-cli/   ubis: index / watch / find / near / refs / open / status
 crates/ubis-bench/ 시간 분할 평가 (text / anchor / anchor+text, grep-read baseline)
 integrations/skills/ubis/SKILL.md   에이전트용 사용법
@@ -55,6 +57,7 @@ integrations/skills/ubis/SKILL.md   에이전트용 사용법
 
 - `incremental_equals_fresh`: 여러 단계 편집(정의 이름 변경, 동명 정의 추가, 삭제, 바이너리 전환) 후 증분 인덱스 == 새 인덱스 (`canonical_dump` 비교).
 - `index_paths_equals_fresh`: watcher 경로(디렉터리 rename 포함)도 동일.
+- `cochange_from_history`: 실제 git 레포에서 hunk→unit 매핑(서수 unit 이동 포함)과, co-change 재계산이 같은 증거에서 같은 dump를 내는지.
 - 새 기능이 저장 내용을 바꾸면 이 두 테스트에 시나리오를 추가한다.
 - 커밋 전: `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings`.
 
@@ -72,7 +75,7 @@ cargo build --release
 
 ## 6. 현재 상태 (v0)
 
-**된 것:** unit 트리와 구조적 ID, gap leaf, SQLite 증거 저장소, 증분 색인, watch, mention→edge 해석(질량 분할, 타입 한정 호출), BM25 + symbol + refs + tree_near + same_file, 적응형 $K$, 시간 분할 하네스.
+**된 것:** unit 트리와 구조적 ID, gap leaf, SQLite 증거 저장소, 증분 색인, watch, mention→edge 해석(질량 분할, 타입 한정 호출), BM25 + symbol + refs + tree_near + same_file + co-change(E1, `ubis index --git`), 적응형 $K$, 시간 분할 하네스(하네스와 CLI가 같은 hunk→unit 매핑 코드를 쓴다).
 
 **측정으로 확인된 것** (REPORT.md):
 - text: fd에서 grep-read@1보다 recall 높고 토큰 1/5. 절대 recall은 낮다(0.25).
@@ -100,7 +103,7 @@ cargo build --release
 
 각 실험은 **가설 → operator/변경 → 하네스 지표 → 채택 기준** 순으로 진행하고 REPORT.md에 결과를 남긴다. 채택 기준의 기본값: 두 코퍼스 모두에서 해당 모드 recall +0.02 이상, 또는 recall을 유지하면서 read_tok −20% 이상.
 
-### E1. co-change operator
+### E1. co-change operator — **채택됨** (REPORT.md, anchor일 때 가중치 0.5)
 - **가설:** 과거에 함께 바뀐 unit은 앞으로도 함께 바뀐다. anchor 모드 recall을 올린다.
 - **정의:** 커밋 $c$가 건드린 unit 집합 $S_c$에 대해 $X^{co}_{ij}=\sum_{c:\,i,j\in S_c} e^{-(T-t_c)/\tau}/(|S_c|-1)$. support ≥ 2.
 - **주의:** 하네스에서는 $T_0$ 이전 커밋만 써야 누수가 없다. hunk → unit 매핑은 그 커밋 시점 파일을 재파싱해서 한다(하네스의 `touched_units`와 같은 로직). Unit Diff가 먼저 있으면 서수 unit도 안정적이다.

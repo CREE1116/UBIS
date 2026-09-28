@@ -77,3 +77,44 @@ anchor 모드가 평균 2.5개만 반환하고 `read-anchor-file`에 recall로 �
 2. co-change operator (hunk는 이미 저장됨) — 시간 분할 안에서 $T_0$ 이전 커밋만 사용
 3. 코퍼스 확대: 코드 비중이 큰 레포 여러 개, 문서 위주 폴더, 한국어 문서
 4. 커밋 제목 대신 이슈 본문 등 더 자연스러운 질의원
+
+## 실험 E1: co-change operator
+
+2026-09-28, macOS arm64. `ubis-bench --cochange <w>` (opt-in, 기본 plan 미포함).
+
+- **가설:** 과거에 함께 바뀐 unit은 앞으로도 함께 바뀐다. anchor 모드 recall을 올린다.
+- **정의:** $T_0$ 이전 커밋만 사용(누수 없음). 커밋 $c$의 unit 집합 $S_c$는 하네스 `touched_units`와 같은 로직(그 커밋 시점 파일 재파싱 → $T_0$ unit으로 매핑, 서수 unit은 Jaccard ≥ 0.3). $X_{ij}=\sum_{c:\,i,j\in S_c} e^{-(T_0-t_c)/\tau}/(|S_c|-1)$, support ≥ 2, $|S_c|\le 40$. 구현: `ubis-core/src/cochange.rs`.
+- **코퍼스 추가:** `BurntSushi/ripgrep@3fce3b5`, `pallets/flask@d73fa1cd` (둘 다 `--holdout 200 --max-commits 900`, `--depth 900` 클론).
+
+anchor recall / read_tok (anchor+text recall은 괄호):
+
+| corpus (n) | read-anchor-file | 기존 | co-change w=0.5 τ=365d | w=0.8 | support=1 | τ=90d | τ=∞ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| fd (60) | 0.437 / 3191 | 0.351 / 1135 (0.336) | **0.470** / 1760 (0.451) | 0.487 | 0.462 (0.461) | 0.487 / 1581 | 0.453 |
+| requests (20) | 0.464 / 5254 | 0.236 / 1034 (0.393) | **0.286** / 1094 (0.393) | 0.286 | 0.311 (0.461) | 0.286 | 0.236 |
+| ripgrep (81) | 0.327 / 12047 | 0.090 / 2034 (0.141) | **0.253** / 4412 (0.292) | 0.265 | 0.285 (0.297) | 0.265 | 0.262 |
+| flask (29) | 0.604 / 3778 | 0.387 / 2606 (0.492) | 0.380 / 2741 (0.485) | 0.380 | 0.380 (0.488) | 0.380 | 0.380 |
+
+재현: `ubis-bench <repo> --holdout H --max-commits M --cochange 0.5 [--cochange-tau D] [--cochange-support S]`.
+
+- **채택 기준 통과(anchor 모드):** fd +0.119, requests +0.050. ripgrep +0.163. flask −0.007(질의 1개 이하 차이, 중립).
+- **fd에서 처음으로 `read-anchor-file`을 넘었다**(0.470 vs 0.437, 토큰 0.55배). ripgrep은 기존 anchor가 0.090으로 거의 작동하지 않았는데(다중 crate, 파일 간 co-change가 많음) 0.253까지 올라 격차가 크게 줄었다.
+- **토큰 비용 증가:** anchor read_tok이 fd 1.5배, ripgrep 2.2배. 여전히 `read-anchor-file`의 1/2~1/3.
+- **감쇠:** τ=∞(감쇠 없음)가 가장 약하다. 90d와 365d는 비슷. 기본은 365d.
+- **support=1**은 requests anchor+text를 크게 올리지만(0.393→0.461, n=20) fd anchor는 내린다. 보류.
+- **flask:** 효과 없음. `read-anchor-file`이 이미 0.604 — 파일 내 co-change 위주라 `same_file`이 이미 잡고 있는 것으로 보인다.
+
+### 기본 plan 편입 (w=0.5, τ=365d, support ≥ 2)
+
+- hunk → unit 매핑을 `ubis-ingest::history::UnitMapper`로 옮겨 하네스(정답·co-change)와 `ubis index --git`이 같은 코드를 쓴다. 파생 테이블 `cochange`에 저장하고 `CoChange` operator가 읽는다. 하네스는 이제 기본 plan을 그대로 측정한다(ablation: `--disable cochange`).
+- **동등성 확인:** 4개 코퍼스에서 `--disable cochange` 결과가 편입 전 기본값과 모든 행·열에서 동일하고, 기본값은 위 w=0.5 열과 동일하다. 즉 매퍼 이전으로 정답 집합이 바뀌지 않았다.
+- **속도** (macOS arm64, release):
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| co-change 구축, ripgrep 703커밋 (하네스) | 수십 초 (파일마다 `git show`) | 2.2s (`cat-file --batch` 1개 + (path, blob) 캐시 + 미색인 경로 생략) |
+| co-change 구축, fd 614커밋 | — | 0.78s |
+| 하네스 전체, ripgrep | 28.2s | 7.3s (grep baseline term 카운트를 파일당 1회로) |
+| `ubis index --git .` ripgrep 첫 실행 (903커밋) | — | 4.3s |
+| 같은 명령 재실행 (변경 없음) | 3.2s | 0.03s (`meta.git_basis` = 버전 + HEAD + 파일 해시가 같으면 생략) |
+| `ubis near` 질의 | — | 9ms |

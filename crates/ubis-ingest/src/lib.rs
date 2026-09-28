@@ -1,6 +1,7 @@
 //! UBIS ingest: text admission, format extractors, and the incremental indexer.
 
 pub mod code;
+pub mod history;
 pub mod markdown;
 pub mod prose;
 pub mod text;

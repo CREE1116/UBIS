@@ -22,9 +22,16 @@ pub struct Commit {
     pub ts: i64,
     pub subject: String,
     pub hunks: Vec<Hunk>,
+    /// Post-commit blob of each changed path (deleted paths omitted).
+    pub blobs: Vec<(String, String)>,
 }
 
 impl Commit {
+    /// Post-commit blob id of `path`, if the commit changed it.
+    pub fn blob(&self, path: &str) -> Option<&str> {
+        self.blobs.iter().find(|(p, _)| p == path).map(|(_, b)| b.as_str())
+    }
+
     pub fn files(&self) -> Vec<&str> {
         let mut f: Vec<&str> = self.hunks.iter().map(|h| h.path.as_str()).collect();
         f.sort();
@@ -67,6 +74,8 @@ pub fn history(repo: &Path, rev: &str, max_commits: usize) -> Result<Vec<Commit>
             "--no-color",
             "--no-ext-diff",
             "-M",
+            "--raw",
+            "--no-abbrev",
             "--unified=0",
             "--format=%x1e%H%x1f%ct%x1f%s",
             "-p",
@@ -91,9 +100,18 @@ pub fn parse_log(raw: &str) -> Vec<Commit> {
         let ts = parts.next().and_then(|t| t.parse().ok()).unwrap_or(0);
         let subject = parts.next().unwrap_or("").to_string();
         let mut hunks = Vec::new();
+        let mut blobs = Vec::new();
         let mut current: Option<String> = None;
         for line in lines {
-            if line.starts_with("diff --git ") {
+            if let Some(raw) = line.strip_prefix(':') {
+                // `:old_mode new_mode old_sha new_sha STATUS\tpath[\tnew_path]`
+                let (meta, paths) = raw.split_once('\t').unwrap_or((raw, ""));
+                let new_sha = meta.split_whitespace().nth(3).unwrap_or("");
+                let path = paths.rsplit('\t').next().unwrap_or("");
+                if !path.is_empty() && !new_sha.is_empty() && new_sha.bytes().any(|b| b != b'0') {
+                    blobs.push((path.to_string(), new_sha.to_string()));
+                }
+            } else if line.starts_with("diff --git ") {
                 current = None;
             } else if let Some(p) = line.strip_prefix("+++ ") {
                 current = if p == "/dev/null" {
@@ -117,6 +135,7 @@ pub fn parse_log(raw: &str) -> Vec<Commit> {
                 ts,
                 subject,
                 hunks,
+                blobs,
             });
         }
     }
@@ -137,6 +156,66 @@ fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
 /// File contents at a revision, or `None` if the path does not exist there.
 pub fn show(repo: &Path, rev: &str, path: &str) -> Option<String> {
     git(repo, &["show", &format!("{rev}:{path}")]).ok()
+}
+
+/// Reads many objects through one `git cat-file --batch` process instead of
+/// spawning `git show` per file.
+pub struct BlobReader {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl BlobReader {
+    pub fn new(repo: &Path) -> Result<Self> {
+        use std::process::Stdio;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("git cat-file --batch")?;
+        let stdin = child.stdin.take().context("cat-file stdin")?;
+        let stdout = std::io::BufReader::new(child.stdout.take().context("cat-file stdout")?);
+        Ok(Self { child, stdin, stdout })
+    }
+
+    /// Contents of an object (`<sha>` or `<rev>:<path>`), `None` if missing
+    /// or not valid UTF-8.
+    pub fn read(&mut self, object: &str) -> Result<Option<String>> {
+        use std::io::{BufRead, Read, Write};
+        writeln!(self.stdin, "{object}")?;
+        self.stdin.flush()?;
+        let mut header = String::new();
+        self.stdout.read_line(&mut header)?;
+        let mut parts = header.split_whitespace();
+        let (_, kind, size) = (parts.next(), parts.next(), parts.next());
+        let Some(size) = size.and_then(|s| s.parse::<usize>().ok()) else {
+            return Ok(None); // "<object> missing"
+        };
+        let mut buf = vec![0u8; size + 1]; // content + trailing newline
+        self.stdout.read_exact(&mut buf)?;
+        buf.truncate(size);
+        if kind != Some("blob") {
+            return Ok(None);
+        }
+        Ok(String::from_utf8(buf).ok())
+    }
+}
+
+impl Drop for BlobReader {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Full commit id of `rev`.
+pub fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
+    Ok(git(repo, &["rev-parse", "--verify", rev])?.trim().to_string())
 }
 
 /// First-parent commit IDs from `rev`, oldest first.
@@ -179,10 +258,11 @@ mod tests {
 
     #[test]
     fn parses_hunks() {
-        let raw = "\u{1e}abc\u{1f}100\u{1f}Fix thing\n\ndiff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3,0 +4,2 @@ fn x\n+a\n+b\n@@ -10 +12 @@\n-x\n+y\n@@ -20,3 +21,0 @@\n-gone\ndiff --git a/old.md b/old.md\n--- a/old.md\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n";
+        let raw = "\u{1e}abc\u{1f}100\u{1f}Fix thing\n\n:100644 100644 1111 2222 M\tsrc/a.rs\n:100644 000000 3333 0000 D\told.md\ndiff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3,0 +4,2 @@ fn x\n+a\n+b\n@@ -10 +12 @@\n-x\n+y\n@@ -20,3 +21,0 @@\n-gone\ndiff --git a/old.md b/old.md\n--- a/old.md\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n";
         let c = parse_log(raw);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].subject, "Fix thing");
+        assert_eq!(c[0].blobs, vec![("src/a.rs".to_string(), "2222".to_string())]);
         assert_eq!(
             c[0].hunks,
             vec![

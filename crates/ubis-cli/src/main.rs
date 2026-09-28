@@ -32,7 +32,7 @@ enum Cmd {
     Index {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Also record git commits and hunks (evidence for co-change and evaluation).
+        /// Also record git commits and hunks, and derive co-change from them.
         #[arg(long)]
         git: bool,
     },
@@ -175,18 +175,9 @@ fn cmd_index(cli: &Cli, path: &Path, git: bool) -> Result<()> {
     let mut store = Store::open(&db)?;
     let started = std::time::Instant::now();
     let report = ubis_ingest::index_dir(&mut store, &root)?;
-    let mut commits = 0;
+    let mut git_note = String::new();
     if git && ubis_git::is_repo(&root) {
-        let history = ubis_git::history(&root, "HEAD", 5000)?;
-        commits = history.len();
-        let rows: Vec<_> = history
-            .into_iter()
-            .map(|c| {
-                let hunks = c.hunks.into_iter().map(|h| (h.path, h.start, h.len)).collect();
-                (c.id, c.ts, c.subject, hunks)
-            })
-            .collect();
-        store.replace_history(&rows)?;
+        git_note = index_git(&mut store, &root)?;
     }
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -201,11 +192,35 @@ fn cmd_index(cli: &Cli, path: &Path, git: bool) -> Result<()> {
             report.removed,
             report.skipped,
             report.edges,
-            if git { format!("; commits {commits}") } else { String::new() }
+            git_note
         );
         println!("db: {}", db.display());
     }
     Ok(())
+}
+
+/// Record git history and derive co-change, unless HEAD and the indexed
+/// files are unchanged since the last run (then the rows would be identical).
+fn index_git(store: &mut Store, root: &Path) -> Result<String> {
+    use ubis_ingest::history::{git_basis, rebuild_cochange, BASIS_KEY};
+    let basis = git_basis(store, root)?;
+    if store.meta(BASIS_KEY)?.as_deref() == Some(basis.as_str()) {
+        return Ok("; git history unchanged".into());
+    }
+    let history = ubis_git::history(root, "HEAD", 5000)?;
+    let now = history.last().map(|c| c.ts).unwrap_or(0);
+    let pairs = rebuild_cochange(store, root, &history, &ubis_core::cochange::CoChangeParams::at(now))?;
+    let commits = history.len();
+    let rows: Vec<_> = history
+        .into_iter()
+        .map(|c| {
+            let hunks = c.hunks.into_iter().map(|h| (h.path, h.start, h.len)).collect();
+            (c.id, c.ts, c.subject, hunks)
+        })
+        .collect();
+    store.replace_history(&rows)?;
+    store.set_meta(BASIS_KEY, &basis)?;
+    Ok(format!("; commits {commits}, co-change pairs {pairs}"))
 }
 
 fn cmd_watch(cli: &Cli, path: &Path, debounce_ms: u64) -> Result<()> {

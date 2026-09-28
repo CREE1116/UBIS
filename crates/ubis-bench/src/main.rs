@@ -22,14 +22,16 @@
 //! its ancestors), hit rate (any gold found), and tokens the agent would read.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::Parser;
 use serde::Serialize;
+use ubis_core::cochange::CoChangeParams;
 use ubis_core::query::{plan, search_with, Query};
 use ubis_core::tokenize::tokenize;
 use ubis_core::Store;
+use ubis_ingest::history::{rebuild_cochange, UnitMapper};
 
 #[derive(Parser)]
 #[command(name = "ubis-bench", about = "Temporal-split retrieval evaluation from git history")]
@@ -54,6 +56,12 @@ struct Args {
     /// Override operator weights, e.g. `--weight lexical=0.5,tree_near=0.2`.
     #[arg(long, value_delimiter = ',')]
     weight: Vec<String>,
+    /// Co-change decay time constant in days.
+    #[arg(long, default_value_t = ubis_core::cochange::TAU_DAYS)]
+    cochange_tau: f64,
+    /// Minimum number of commits a co-change pair must appear in.
+    #[arg(long, default_value_t = ubis_core::cochange::MIN_SUPPORT)]
+    cochange_support: usize,
     /// Maximum commits read from history.
     #[arg(long, default_value_t = 5000)]
     max_commits: usize,
@@ -133,13 +141,30 @@ fn main() -> Result<()> {
         stats.edges
     );
 
+    // Co-change from evidence commits only (≤ T0): no leakage into held-out.
+    let started = std::time::Instant::now();
+    let pairs = rebuild_cochange(
+        &mut store,
+        &repo,
+        &commits[..split],
+        &CoChangeParams {
+            tau: args.cochange_tau * 86400.0,
+            min_support: args.cochange_support,
+            max_set: args.max_gold,
+            ..CoChangeParams::at(t0.ts)
+        },
+    )?;
+    eprintln!("co-change: {pairs} pairs in {:.2}s", started.elapsed().as_secs_f64());
+
     let file_texts = load_files(&store)?;
+    let file_terms = term_counts(&file_texts);
     let mut aggs: BTreeMap<&'static str, Agg> = BTreeMap::new();
     let mut skipped_empty = 0;
     let mut skipped_bulk = 0;
 
+    let mut mapper = UnitMapper::new(&store, &repo)?;
     for c in held {
-        let gold = touched_units(&repo, c, &store)?;
+        let gold = mapper.touched(c)?;
         if gold.is_empty() {
             skipped_empty += 1;
             continue;
@@ -165,7 +190,7 @@ fn main() -> Result<()> {
                 eprintln!("[text] {:.2} {:>3} | {} | gold {:?}", r, n, c.subject, gold_vec);
             }
             for files in [1usize, 3] {
-                let (r, t) = grep_read(&c.subject, files, &gold, &file_texts, &store)?;
+                let (r, t) = grep_read(&c.subject, files, &gold, &file_texts, &file_terms, &store)?;
                 let name = if files == 1 { "grep-read@1 text" } else { "grep-read@3 text" };
                 aggs.entry(name).or_default().add(r, files, t);
             }
@@ -181,7 +206,7 @@ fn main() -> Result<()> {
                     anchor: Some(anchor.clone()),
                     scope: None,
                     k_max: args.k,
-                k_min: args.k_min,
+                    k_min: args.k_min,
                 };
                 let (r, n, t) = run(&store, &q, &rest, &args)?;
                 aggs.entry(name).or_default().add(r, n, t);
@@ -218,67 +243,6 @@ fn main() -> Result<()> {
         args.max_gold
     );
     Ok(())
-}
-
-/// Leaf units touched by a commit, mapped onto units that exist at T0.
-///
-/// Named units (`path::Type::method`, `path#section`) match by ID. Ordinal
-/// units (`¶3`, `~2`, `code1`) shift when text is inserted above them, so they
-/// match the T0 leaf in the same file with the highest token Jaccard (≥ 0.3).
-fn touched_units(repo: &Path, c: &ubis_git::Commit, store: &Store) -> Result<BTreeSet<String>> {
-    let mut out = BTreeSet::new();
-    for path in c.files() {
-        let Some(content) = ubis_git::show(repo, &c.id, path) else { continue };
-        let Some(content) = ubis_ingest::admit(Path::new(path), content.as_bytes()) else {
-            continue;
-        };
-        let Ok(ex) = ubis_ingest::extract(path, &content) else { continue };
-        let t0_leaves: Vec<(String, BTreeSet<String>)> = store
-            .units_in_file(path)?
-            .into_iter()
-            .filter(|u| u.is_leaf)
-            .map(|u| (u.id, tokenize(&u.text).into_iter().collect()))
-            .collect();
-        let parents: BTreeSet<&str> = ex.units.iter().filter_map(|u| u.parent.as_deref()).collect();
-        for h in c.hunks.iter().filter(|h| h.path == path) {
-            let (a, b) = (h.start, h.start + h.len - 1);
-            for u in &ex.units {
-                if parents.contains(u.id.as_str()) || !(u.start_line <= b && a <= u.end_line) {
-                    continue;
-                }
-                if !is_ordinal(&u.id) {
-                    if store.unit(&u.id)?.is_some() {
-                        out.insert(u.id.clone());
-                    }
-                    continue;
-                }
-                let toks: BTreeSet<String> = tokenize(&u.text).into_iter().collect();
-                let best = t0_leaves
-                    .iter()
-                    .filter(|(id, _)| is_ordinal(id))
-                    .map(|(id, t)| (jaccard(&toks, t), id))
-                    .filter(|(j, _)| *j >= 0.3)
-                    .max_by(|x, y| x.0.total_cmp(&y.0).then_with(|| y.1.cmp(x.1)));
-                if let Some((_, id)) = best {
-                    out.insert(id.clone());
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn is_ordinal(id: &str) -> bool {
-    let last = id.rsplit(['/', '#']).next().unwrap_or("");
-    last.starts_with('¶') || last.starts_with('~') || last.starts_with("code") || !id.contains(['/', '#', ':'])
-}
-
-fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let inter = a.intersection(b).count() as f64;
-    inter / (a.len() as f64 + b.len() as f64 - inter)
 }
 
 /// Run one query; returns (recall, number returned, tokens to read the spans).
@@ -332,6 +296,20 @@ fn load_files(store: &Store) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// Term counts per file, computed once for the grep baseline.
+fn term_counts(texts: &HashMap<String, String>) -> HashMap<String, HashMap<String, usize>> {
+    texts
+        .iter()
+        .map(|(path, text)| {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for t in tokenize(text) {
+                *counts.entry(t).or_default() += 1;
+            }
+            (path.clone(), counts)
+        })
+        .collect()
+}
+
 /// Baseline: rank files by distinct query terms present (ties: total
 /// occurrences, then path), read the top `files` files whole.
 fn grep_read(
@@ -339,19 +317,15 @@ fn grep_read(
     files: usize,
     gold: &BTreeSet<String>,
     texts: &HashMap<String, String>,
+    terms_of: &HashMap<String, HashMap<String, usize>>,
     store: &Store,
 ) -> Result<(f64, f64)> {
     let mut terms = tokenize(subject);
     terms.sort();
     terms.dedup();
-    let mut ranked: Vec<(usize, usize, &String)> = texts
+    let mut ranked: Vec<(usize, usize, &String)> = terms_of
         .iter()
-        .map(|(path, text)| {
-            let toks = tokenize(text);
-            let mut counts: HashMap<&str, usize> = HashMap::new();
-            for t in &toks {
-                *counts.entry(t.as_str()).or_default() += 1;
-            }
+        .map(|(path, counts)| {
             let distinct = terms.iter().filter(|t| counts.contains_key(t.as_str())).count();
             let total: usize = terms.iter().map(|t| counts.get(t.as_str()).copied().unwrap_or(0)).sum();
             (distinct, total, path)

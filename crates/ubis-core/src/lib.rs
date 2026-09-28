@@ -2,10 +2,12 @@
 //!
 //! * [`model`]: units, definitions, mentions, edges
 //! * [`store`]: SQLite evidence store (the only source of truth)
+//! * [`cochange`]: co-change matrix derived from commit evidence
 //! * [`resolve`]: mentions ⋈ definitions → weighted edges
 //! * [`query`]: planner and three-stage retrieval cascade
 //! * [`tokenize`]: deterministic tokenizer for code, prose, and Hangul
 
+pub mod cochange;
 pub mod model;
 pub mod query;
 pub mod resolve;

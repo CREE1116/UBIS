@@ -7,7 +7,7 @@ description: Locate code and document units in this project with the local UBIS 
 
 The project has a local index (`.ubis/index.db`). Prefer it over `grep` + reading whole files.
 
-1. `ubis index .` if the index is missing or files changed (incremental, fast).
+1. `ubis index .` if the index is missing or files changed (incremental, fast). In a git repo, `ubis index --git .` also learns which units changed together in past commits; `near`/`--anchor` then suggest them (`via cochange`).
 2. Describe what you need: `ubis find "<what it does>"`. Results are unit spans: `path:start-end  unit-id`.
 3. When you are already looking at a unit, pass it as an anchor:
    - `ubis near <unit-id>` — units that reference it, units it references, siblings.

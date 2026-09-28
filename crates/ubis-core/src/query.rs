@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::cochange::CoChange;
 use crate::model::*;
 use crate::store::{Store, UnitRow};
 use crate::tokenize::{is_identifier_shaped, tokenize};
@@ -311,6 +312,8 @@ pub fn plan(q: &Query) -> Plan {
         ops.push((Box::new(RefsOut { limit: 50 }), 0.8));
         ops.push((Box::new(TreeNear { limit: 30 }), 0.3));
         ops.push((Box::new(SameFile { limit: 30 }), 0.2));
+        // Empty without git history (`ubis index --git`); measured in REPORT.md E1.
+        ops.push((Box::new(CoChange { limit: 50 }), 0.5));
     }
     Plan { ops }
 }

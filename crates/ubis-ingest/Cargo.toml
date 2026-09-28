@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ubis-core = { path = "../ubis-core" }
+ubis-git = { path = "../ubis-git" }
 anyhow.workspace = true
 serde.workspace = true
 blake3.workspace = true

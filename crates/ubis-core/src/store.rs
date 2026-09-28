@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::cochange::CoChangeIndex;
 use crate::model::*;
 use crate::resolve;
 use crate::tokenize::tokenize;
@@ -61,6 +62,8 @@ CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
 CREATE TABLE IF NOT EXISTS commits(id TEXT PRIMARY KEY, ts INTEGER NOT NULL, subject TEXT NOT NULL, seq INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS hunks(commit_id TEXT NOT NULL, path TEXT NOT NULL, start_line INTEGER NOT NULL, len INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS hunks_commit ON hunks(commit_id);
+CREATE TABLE IF NOT EXISTS cochange(src TEXT NOT NULL, dst TEXT NOT NULL, weight REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS cochange_src ON cochange(src);
 "#;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -144,6 +147,19 @@ impl Store {
         Ok(Self { conn })
     }
 
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)", [key, value])?;
+        Ok(())
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -155,6 +171,13 @@ impl Store {
             .conn
             .query_row("SELECT hash FROM files WHERE path=?1", [path], |r| r.get(0))
             .optional()?)
+    }
+
+    /// `(path, content hash)` of every indexed file, sorted by path.
+    pub fn file_hashes(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT path, hash FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn file_paths(&self) -> Result<Vec<String>> {
@@ -410,6 +433,30 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the derived co-change matrix (both directions stored).
+    pub fn replace_cochange(&mut self, index: &CoChangeIndex) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM cochange", [])?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare("INSERT INTO cochange(src, dst, weight) VALUES(?1,?2,?3)")?;
+            for (src, dst, w) in index.iter() {
+                stmt.execute(params![src, dst, w])?;
+                n += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(n / 2)
+    }
+
+    pub fn cochange_from(&self, src: &str) -> Result<Vec<(UnitId, f64)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT dst, weight FROM cochange WHERE src=?1 ORDER BY dst")?;
+        let rows = stmt.query_map([src], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     // ---------------------------------------------------------- inspection
 
     /// Canonical, order-independent dump of all evidence and derived edges.
@@ -423,6 +470,7 @@ impl Store {
             ("definitions", "SELECT unit_id, name, kind FROM definitions"),
             ("mentions", "SELECT unit_id, name, kind, line FROM mentions"),
             ("edges", "SELECT src, dst, kind, origin, printf('%.9f', weight), line FROM edges"),
+            ("cochange", "SELECT src, dst, printf('%.9f', weight) FROM cochange"),
         ] {
             let mut stmt = self.conn.prepare(sql)?;
             let n = stmt.column_count();

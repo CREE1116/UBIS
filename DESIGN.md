@@ -46,6 +46,7 @@ Ingest      walker(.gitignore) → 텍스트 판별 → extractor → 파일 단
 | `refs_in` / `refs_out` | anchor로 들어오는/나가는 엣지 질량 | 방향 있음 |
 | `tree_near` | anchor 형제, 문서 순서 거리 $1/(1+d)$ | |
 | `same_file` | anchor 파일의 다른 leaf, $1/(1+d/4)$ | 파일 내부 co-change를 unit 단위로 |
+| `cochange` | 파생 테이블 `cochange`의 질량 (아래) | `ubis index --git`일 때만 채워짐 |
 
 - **Planner**: 식별자형 질의 → `symbol` 가중; anchor 있음 → 관계 operator + 텍스트는 0.25로 낮춤(하네스로 측정해 정함).
 - **Stage B**: $\phi_f = \text{raw}_f/\max\text{raw}_f$, $s=\sum_f w_f\phi_f$. 점수 간격을 보존해야 적응형 $K$가 의미 있다.
@@ -69,7 +70,7 @@ git은 증거이자 채점자라서 **시간으로 자른다**. $T_0$ 시점 트
 
 ## 실험 트랙 (코어 아님)
 
-1. **co-change operator**: $X^{co}_{ij}=\sum_c e^{-(T-t_c)/\tau}/(|S_c|-1)$, 커밋 $c$가 건드린 unit 집합 $S_c$. hunk는 이미 `index --git`으로 저장된다.
+1. ~~co-change operator~~: 채택됨. $X^{co}_{ij}=\sum_c e^{-(T-t_c)/\tau}/(|S_c|-1)$, τ=365일, support ≥ 2, $|S_c|\le 40$. $S_c$는 커밋 시점 blob을 재파싱해 현재 unit으로 매핑(`ubis-ingest::history`, 하네스와 공유). blob은 `git cat-file --batch` 하나로 읽고 (path, blob)마다 한 번만 파싱한다. 파생 테이블 `cochange`에 양방향 저장. 이후 편집으로 사라진 ID는 cascade에서 걸러지고 다음 `index --git`에서 재계산된다.
 2. **term EASE 쿼리 확장**: $\tilde q = q\,G(G+\lambda I)^{-1}$ (low-rank). 신경망 없이 공출현 기반 동의어.
 3. **relation factor**: $X_t\approx U S V^\top$, $u=S^{1/2}U$(바라봄), $v=S^{1/2}V$(바라봐짐). $s(A\to B)=\langle u_A,v_B\rangle$. co-citation은 EASE 형태
    $B_{ij}=\langle a_i,a_j\rangle/(1-\lVert a_j\rVert^2)$, $a=\mathrm{diag}\big(\sqrt{\lambda_k/(\lambda_k+\lambda)}\big)V^\top$ (정확한 등식).
