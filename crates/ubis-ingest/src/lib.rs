@@ -53,6 +53,23 @@ fn extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Files modified within this window of the last check are re-read even if
+/// their stat looks unchanged (same idea as git's racy-clean check).
+const RACY_NS: i128 = 2_000_000_000;
+
+fn file_stat(path: &Path) -> Option<(u64, i128)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as i128;
+    Some((m.len(), mtime))
+}
+
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
 /// Run the extractor matching the file's format. `rel` uses `/` separators.
 pub fn extract(rel: &str, content: &str) -> Result<Extracted> {
     let ext = rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -118,9 +135,31 @@ pub fn index_dir(store: &mut Store, root: &Path) -> Result<IndexReport> {
     let mut report = IndexReport::default();
     let mut seen = BTreeSet::new();
     let known: BTreeSet<String> = store.file_paths()?.into_iter().collect();
+    let stats = store.stat_cache()?;
+    let now = now_ns();
+    let mut new_stats = Vec::new();
+    let mut walked = BTreeSet::new();
     for rel in walk(root) {
         report.scanned += 1;
         let abs = root.join(&rel);
+        walked.insert(rel.clone());
+        let stat = file_stat(&abs);
+        if let (Some((size, mtime)), Some(&(c_size, c_mtime, checked))) = (stat, stats.get(&rel)) {
+            // Unchanged stat, and not modified around the last check (a write
+            // in the same clock tick could keep size and mtime): skip reading.
+            if size == c_size && mtime == c_mtime && mtime + RACY_NS < checked {
+                if known.contains(&rel) {
+                    seen.insert(rel);
+                    report.unchanged += 1;
+                } else {
+                    report.skipped += 1;
+                }
+                continue;
+            }
+        }
+        if let Some((size, mtime)) = stat {
+            new_stats.push((rel.clone(), size, mtime, now));
+        }
         let Ok(bytes) = std::fs::read(&abs) else {
             report.skipped += 1;
             continue;
@@ -152,6 +191,8 @@ pub fn index_dir(store: &mut Store, root: &Path) -> Result<IndexReport> {
         store.remove_file(path)?;
         report.removed += 1;
     }
+    let gone: Vec<String> = stats.keys().filter(|p| !walked.contains(*p)).cloned().collect();
+    store.update_stat_cache(&new_stats, &gone)?;
     if report.added + report.updated + report.removed > 0 {
         report.edges = store.rebuild_edges()?;
     } else {
@@ -181,6 +222,9 @@ pub fn index_paths(store: &mut Store, root: &Path, changed: &BTreeSet<String>) -
         targets.extend(under(&allowed, c));
         targets.extend(under(&known, c));
     }
+    // Force the next full scan to re-read what the watcher saw change.
+    let invalid: Vec<String> = targets.iter().cloned().collect();
+    store.update_stat_cache(&[], &invalid)?;
     for rel in targets {
         let is_known = known.contains(&rel);
         if !allowed.contains(&rel) {

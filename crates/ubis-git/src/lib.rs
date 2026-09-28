@@ -225,6 +225,11 @@ pub fn diff(repo: &Path, base: &str, head: &str) -> Result<Commit> {
     parse_log(&record).pop().context("empty diff record")
 }
 
+/// Root of the work tree containing `dir`.
+pub fn toplevel(dir: &Path) -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?.trim()))
+}
+
 /// Full commit id of `rev`.
 pub fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
     Ok(git(repo, &["rev-parse", "--verify", rev])?.trim().to_string())

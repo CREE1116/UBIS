@@ -1,19 +1,15 @@
 ---
 name: ubis
-description: Locate code and document units in this project with the local UBIS index before grepping or opening whole files. Use when looking for where something is implemented or described, or what else to check near the unit being edited.
+description: Locate code and document units in this project with the local UBIS index before grepping or opening whole files. Use when looking for where something is implemented or described, or what else to check near code you are editing.
 ---
 
 # UBIS: find units, not files
 
-The project has a local index (`.ubis/index.db`). Prefer it over `grep` + reading whole files.
+```bash
+ubis find "<what the code does, or the task title>"   # → path:start-end spans to read
+ubis near <path:line | unit-id | Name>                # → callers, callees, siblings, co-changed units
+```
 
-1. `ubis index .` if the index is missing or files changed (incremental, fast). In a git repo, `ubis index --git .` also learns which units changed together in past commits; `near`/`--anchor` then suggest them (`via cochange`).
-2. Describe what you need: `ubis find "<what it does>"`. Results are unit spans: `path:start-end  unit-id`.
-3. When you are already looking at a unit, pass it as an anchor:
-   - `ubis near <unit-id>` — units that reference it, units it references, siblings.
-   - `ubis find --anchor <unit-id> "<refinement>"`.
-4. `ubis refs <unit-id>` lists every recorded reference (with resolution mass; `global` origin means name-based, not proven).
-5. `ubis open <unit-id>` prints just that span; `--out` zooms to the parent.
+Read only the returned spans. Typical flow: `find` with the task, then `near` on the best hit to see what else the change touches.
 
-Results are candidates, not proof. Open the current file at the given lines before editing; the index may lag the working tree.
-Add `--json` for machine-readable output.
+Results are candidates with evidence (`via`), not proof. The index refreshes itself on every call.

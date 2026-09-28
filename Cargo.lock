@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "ubis-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "ubis-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "ubis-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -755,14 +755,14 @@ dependencies = [
 
 [[package]]
 name = "ubis-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "ubis-ingest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",

@@ -157,7 +157,7 @@ text(1 call) recall: fd 0.370→0.366, ripgrep 0.157→0.238, requests 0.239→0
 
 - **가설:** 누구나 참조하는 대상(`Config`, `as_ref`)은 anchor에 대해 정보가 적다. `refs_out`은 $1/(1+\ln(1+\text{indeg}))$, `refs_in`은 out-degree로 할인. 동률(`refs_out 0.80` 7개가 ID 순)도 깬다.
 - **결과:** 커밋 anchor recall fd 0.470→0.470, requests 동일, ripgrep 0.253→0.272, flask 0.368→0.418. anchor+text ripgrep −0.008. PR 태스크 anchor ±0.006. ripgrep anchor+text 토큰 −27%.
-- 두 코퍼스 +0.02 기준을 flask 하나만 넘는다. `SPECIFICITY = false`로 두고 기록만 한다. 동률 문제 자체는 남아 있다.
+- 두 코퍼스 +0.02 기준을 flask 하나만 넘는다. 기각. (v0.3에서 꺼진 플래그로 남기지 않고 코드에서 제거.) 동률 문제 자체는 남아 있다.
 
 ## 구조 정리 (동작 불변 확인)
 
@@ -180,3 +180,23 @@ text(1 call) recall: fd 0.370→0.366, ripgrep 0.157→0.238, requests 0.239→0
 | 과거 파일 파싱 캐시가 태스크 사이에 사라짐 | **실패.** 설명 어휘(reparse, cache, versions)와 코드 어휘(`UnitMapper`, `blob`, `leaves`)가 다름. 코드 어휘로 물으면 1위 |
 
 관찰: 1 call로 절반, 2 call(`find→near`)로 4/5. 남은 실패는 어휘 불일치 — E2(term 확장)의 동기. 또 `x.iter()` 같은 std 메서드 호출이 로컬 `CoChangeIndex::iter`로 해석되는 잡음이 `near`에 보인다(수신 타입을 모르는 메서드 호출의 global 해석).
+
+## v0.3: 알아야 할 것을 줄이기
+
+원칙: 사용자와 에이전트가 쓸데없이 많은 것을 알 필요가 없어야 한다. 에이전트가 알아야 하는 것은 `find`와 `near` 두 명령뿐이다.
+
+- **자동 갱신:** 모든 질의 명령이 답하기 전에 증분 색인한다. 파일은 항상, git 이력은 `HEAD`가 움직였을 때만 다시 파생한다. 명시적 `ubis index`는 파일이 바뀌면 이력도 재파생해서(정확 모드) 새로 만든 인덱스와 같은 결과를 보장한다.
+- **stat 캐시:** `stat_cache(path, size, mtime_ns, checked_ns)`. 크기·mtime이 같고 마지막 확인보다 2초 이상 전에 수정된 파일은 읽지 않는다(git의 racy-clean 규칙과 같은 발상). 증거가 아니라 읽기 생략용 캐시이며 내용 해시가 여전히 기준이다. `incremental_equals_fresh`(2초 안에 연속 편집)가 그대로 통과한다.
+- **첫 호출 자동 색인:** git 레포 안에서 인덱스가 없으면 레포 루트에 만든다. `.ubis/.gitignore`(`*`)로 `git status`를 오염시키지 않는다. git 밖에서는 `ubis index <dir>`를 안내하고 멈춘다(홈 디렉터리 전체 색인 같은 사고 방지).
+- **`path:line` anchor:** `ubis near src/walk.rs:620` → 그 줄을 포함하는 가장 작은 unit. 경로는 인덱스 루트 기준, 현재 디렉터리 기준, 절대 경로 모두 받는다.
+- **`--git` 기본값:** git 레포면 항상 이력을 쓴다(`--no-git`으로 끔).
+- **MCP 서버는 만들지 않음:** 스킬 + CLI로 충분하고, 자동 갱신으로 스킬 쪽의 주된 불편(색인 단계 기억)이 없어졌다. 인터페이스를 하나 더 두는 비용이 더 크다.
+- **`watch` 단순화:** 이벤트가 오면 `refresh()` 하나로 처리한다. `.git` 변화(커밋, checkout)도 이력 재파생으로 이어진다.
+
+측정 (ripgrep, 221 파일 / 903 커밋, macOS arm64): 첫 호출 4~5s, 이후 갱신 오버헤드 10~20ms(`find` 전체 0.02~0.03s, `--no-refresh` 0.01s).
+
+## E9: 메서드 호출의 외부 몫, noisy-OR
+
+**외부 몫 — 채택(정합성).** 수신 타입을 모르는 호출(`x.len()`, Python `obj.f()`, Java `x.f()`)을 새 mention 종류 `method`로 기록하고, 후보 $m$개에 "프로젝트 밖" 1개를 더해 $1/(m+1)$씩 나눈다. 원칙 4(모호함은 질량으로)를 그대로 적용한 것이다. 벤치 영향은 중립이다: 커밋 모드 anchor+text fd 0.452→0.457, ripgrep 0.295→0.302, 나머지 ±0.002. PR 태스크 동일(ripgrep anchor+text 0.350→0.348). 회귀 없이 잘못된 확정 엣지를 줄이므로 채택.
+
+**noisy-OR — 기각.** 위 수정 후에도 `resolve_unit`의 `.iter()` 두 번이 0.5+0.5=1.0으로 합산되어 확정 참조와 동률이었다. 같은 엣지의 여러 mention을 $1-\prod(1-w_i)$로 합치면 [0,1] 확률처럼 된다. 결과: ripgrep anchor +0.012(커밋·PR 모두), PR 태스크 ripgrep anchor+text **−0.025**, 나머지 동일. 기준 미달로 기각하고 코드에서 제거했다. 합산은 "여러 번 부르는 대상이 더 관련 있다"는 신호도 담고 있어서, 이를 버리면 anchor+text에서 손해를 보는 것으로 보인다.

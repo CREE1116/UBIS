@@ -73,6 +73,7 @@ CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
 CREATE TABLE IF NOT EXISTS commits(id TEXT PRIMARY KEY, ts INTEGER NOT NULL, subject TEXT NOT NULL, seq INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS hunks(commit_id TEXT NOT NULL, path TEXT NOT NULL, start_line INTEGER NOT NULL, len INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS hunks_commit ON hunks(commit_id);
+CREATE TABLE IF NOT EXISTS stat_cache(path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, checked_ns INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS commit_blobs(commit_id TEXT NOT NULL, path TEXT NOT NULL, blob TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS commit_blobs_commit ON commit_blobs(commit_id);
 CREATE TABLE IF NOT EXISTS cochange(src TEXT NOT NULL, dst TEXT NOT NULL, weight REAL NOT NULL);
@@ -186,6 +187,48 @@ impl Store {
             .optional()?)
     }
 
+    /// Filesystem stat cache: `path → (size, mtime_ns, checked_ns)`. Not
+    /// evidence — only lets the indexer skip reading files whose stat is
+    /// unchanged. Content hashes stay authoritative.
+    pub fn stat_cache(&self) -> Result<HashMap<String, (u64, i128, i128)>> {
+        let mut stmt = self.conn.prepare("SELECT path, size, mtime_ns, checked_ns FROM stat_cache")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as i128, r.get::<_, i64>(3)? as i128),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Upsert `(path, size, mtime_ns, checked_ns)` rows and delete `removed`.
+    pub fn update_stat_cache(&mut self, rows: &[(String, u64, i128, i128)], removed: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut up = tx.prepare(
+                "INSERT OR REPLACE INTO stat_cache(path, size, mtime_ns, checked_ns) VALUES(?1,?2,?3,?4)",
+            )?;
+            for (path, size, mtime, checked) in rows {
+                up.execute(params![path, *size as i64, *mtime as i64, *checked as i64])?;
+            }
+            let mut del = tx.prepare("DELETE FROM stat_cache WHERE path=?1")?;
+            for path in removed {
+                del.execute([path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The smallest unit of `path` whose span contains `line`.
+    pub fn unit_at(&self, path: &str, line: usize) -> Result<Option<UnitRow>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "{UNIT_SELECT} WHERE path=?1 AND start_line<=?2 AND end_line>=?2 \
+             ORDER BY (end_line - start_line), is_leaf DESC, ord LIMIT 1"
+        ))?;
+        Ok(stmt.query_row(params![path, line as i64], unit_from_row).optional()?)
+    }
+
     /// `(path, content hash)` of every indexed file, sorted by path.
     pub fn file_hashes(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare("SELECT path, hash FROM files ORDER BY path")?;
@@ -282,18 +325,6 @@ impl Store {
             ))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// Number of edges into `dst` (how often it is referenced).
-    pub fn in_degree(&self, dst: &str) -> Result<usize> {
-        let mut stmt = self.conn.prepare_cached("SELECT COUNT(*) FROM edges WHERE dst=?1")?;
-        Ok(stmt.query_row([dst], |r| r.get::<_, i64>(0))? as usize)
-    }
-
-    /// Number of edges out of `src` (how many references it makes).
-    pub fn out_degree(&self, src: &str) -> Result<usize> {
-        let mut stmt = self.conn.prepare_cached("SELECT COUNT(*) FROM edges WHERE src=?1")?;
-        Ok(stmt.query_row([src], |r| r.get::<_, i64>(0))? as usize)
     }
 
     pub fn edges_from(&self, src: &str) -> Result<Vec<Edge>> {

@@ -194,29 +194,28 @@ fn collect_identifiers(ctx: &Ctx<'_, '_>, node: Node<'_>, out: &mut Vec<(String,
 /// (`HashMap::new`, `Self::open` → `Store::open`) so resolution does not
 /// confuse `Vec::new()` with a local `new`. Module paths (`bm25::f`) are
 /// lowercase by convention and resolve by simple name.
-fn rust_callee(ctx: &Ctx<'_, '_>, f: Node<'_>, scope: &Scope) -> Option<String> {
+fn rust_callee(ctx: &Ctx<'_, '_>, f: Node<'_>, scope: &Scope) -> Option<(String, MentionKind)> {
+    let call = |n: String| Some((n, MentionKind::Call));
     match f.kind() {
-        "identifier" => Some(text(ctx, f).to_string()),
+        "identifier" => call(text(ctx, f).to_string()),
         "scoped_identifier" => {
             let name = field_text(ctx, f, "name")?;
             let qualifier = field_text(ctx, f, "path").map(|p| rust_type_name(&p));
             match qualifier.as_deref() {
-                Some("Self") => Some(match &scope.self_type {
+                Some("Self") => call(match &scope.self_type {
                     Some(t) => format!("{t}::{name}"),
                     None => name,
                 }),
-                Some(q) if q.chars().next().is_some_and(|c| c.is_uppercase()) => {
-                    Some(format!("{q}::{name}"))
-                }
-                _ => Some(name),
+                Some(q) if q.chars().next().is_some_and(|c| c.is_uppercase()) => call(format!("{q}::{name}")),
+                _ => call(name),
             }
         }
         "field_expression" => {
             let field = field_text(ctx, f, "field")?;
             let on_self = f.child_by_field_name("value").is_some_and(|v| v.kind() == "self");
             Some(match (&scope.self_type, on_self) {
-                (Some(t), true) => format!("{t}::{field}"),
-                _ => field,
+                (Some(t), true) => (format!("{t}::{field}"), MentionKind::Call),
+                _ => (field, MentionKind::Method),
             })
         }
         "generic_function" => f
@@ -303,8 +302,8 @@ fn visit_rust(ctx: &mut Ctx<'_, '_>, node: Node<'_>, scope: &Scope) {
         }
         "call_expression" => {
             if let Some(f) = node.child_by_field_name("function") {
-                if let Some(name) = rust_callee(ctx, f, scope) {
-                    ctx.tree.mention(&scope.unit, &name, MentionKind::Call, start_line(node));
+                if let Some((name, kind)) = rust_callee(ctx, f, scope) {
+                    ctx.tree.mention(&scope.unit, &name, kind, start_line(node));
                 }
             }
             visit_children(ctx, node, scope);
@@ -360,20 +359,20 @@ fn visit_python(ctx: &mut Ctx<'_, '_>, node: Node<'_>, scope: &Scope) {
         "call" => {
             if let Some(f) = node.child_by_field_name("function") {
                 let name = match f.kind() {
-                    "identifier" => Some(text(ctx, f).to_string()),
+                    "identifier" => Some((text(ctx, f).to_string(), MentionKind::Call)),
                     "attribute" => field_text(ctx, f, "attribute").map(|a| {
                         let on_self = f
                             .child_by_field_name("object")
                             .is_some_and(|o| text(ctx, o) == "self" || text(ctx, o) == "cls");
                         match (&scope.self_type, on_self) {
-                            (Some(t), true) => format!("{t}::{a}"),
-                            _ => a,
+                            (Some(t), true) => (format!("{t}::{a}"), MentionKind::Call),
+                            _ => (a, MentionKind::Method),
                         }
                     }),
                     _ => None,
                 };
-                if let Some(name) = name {
-                    ctx.tree.mention(&scope.unit, &name, MentionKind::Call, start_line(node));
+                if let Some((name, kind)) = name {
+                    ctx.tree.mention(&scope.unit, &name, kind, start_line(node));
                 }
             }
             visit_children(ctx, node, scope);
@@ -411,7 +410,12 @@ fn visit_java(ctx: &mut Ctx<'_, '_>, node: Node<'_>, scope: &Scope) {
         }
         "method_invocation" => {
             if let Some(name) = field_text(ctx, node, "name") {
-                ctx.tree.mention(&scope.unit, &name, MentionKind::Call, start_line(node));
+                // `foo()` / `this.foo()` stay in the class; `x.foo()` may not.
+                let receiver = node
+                    .child_by_field_name("object")
+                    .filter(|o| o.kind() != "this");
+                let kind = if receiver.is_some() { MentionKind::Method } else { MentionKind::Call };
+                ctx.tree.mention(&scope.unit, &name, kind, start_line(node));
             }
             visit_children(ctx, node, scope);
         }

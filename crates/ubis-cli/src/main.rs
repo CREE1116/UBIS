@@ -3,15 +3,13 @@
 //! A deterministic local index that hands an agent a short list of exact
 //! spans instead of a map to explore.
 
+mod session;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ubis_core::query::{search, Hit, Query};
-use ubis_core::{Store, UnitRow};
-
-const DB_DIR: &str = ".ubis";
-const DB_FILE: &str = "index.db";
+use session::{Session, DB_DIR, DB_FILE};
 
 #[derive(Parser)]
 #[command(name = "ubis", version, about = "Unit-level local index for agents: where, not what")]
@@ -22,18 +20,25 @@ struct Cli {
     /// Emit JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
+    /// Answer from the index as is, without first re-indexing changed files.
+    #[arg(long, global = true)]
+    no_refresh: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Index a directory (incremental: only changed files are re-extracted).
+    /// Index a directory (incremental). In a git repository, also records
+    /// history and derives co-change.
     Index {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Also record git commits and hunks, and derive co-change from them.
+        /// Skip git history (no co-change).
         #[arg(long)]
+        no_git: bool,
+        /// Accepted for compatibility; git history is on by default.
+        #[arg(long, hide = true)]
         git: bool,
     },
     /// Index, then keep the index current from filesystem events.
@@ -48,7 +53,7 @@ enum Cmd {
     Find {
         /// Query text (may be empty when --anchor is given).
         text: Vec<String>,
-        /// Unit the agent is currently looking at.
+        /// Unit the agent is looking at: ID, name, or `path:line`.
         #[arg(short, long)]
         anchor: Option<String>,
         /// Restrict to paths with this prefix.
@@ -60,18 +65,23 @@ enum Cmd {
     },
     /// Print a unit's span. `--out` zooms to the parent; containers list children.
     Open {
+        /// ID, name, or `path:line`.
         unit: String,
         #[arg(long)]
         out: bool,
     },
-    /// Units near an anchor: references in and out, and siblings.
+    /// Units near an anchor: references in and out, siblings, co-change.
     Near {
+        /// ID, name, or `path:line`.
         unit: String,
         #[arg(short, long, default_value_t = 10)]
         k: usize,
     },
     /// Every recorded reference to a unit (exact, with resolution mass).
-    Refs { unit: String },
+    Refs {
+        /// ID, name, or `path:line`.
+        unit: String,
+    },
     /// Index statistics.
     Status,
 }
@@ -79,90 +89,61 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Index { path, git } => cmd_index(&cli, path, *git),
+        Cmd::Index { path, no_git, .. } => cmd_index(&cli, path, !no_git),
         Cmd::Watch { path, debounce_ms } => cmd_watch(&cli, path, *debounce_ms),
         Cmd::Find { text, anchor, scope, k } => {
-            let store = open_store(&cli)?;
-            // Same resolution as `near`: an ambiguous anchor lists its
-            // candidates instead of silently taking one.
-            let anchor = match anchor {
-                Some(a) => Some(resolve_unit(&store, a)?.id),
-                None => None,
-            };
-            let q = Query {
-                text: text.join(" "),
-                anchor,
-                scope: scope.clone(),
-                k_max: *k,
-                k_min: None,
-            };
-            if q.text.trim().is_empty() && q.anchor.is_none() {
-                bail!("give query text, --anchor, or both");
-            }
-            print_hits(&cli, &search(&store, &q)?.hits)
+            let s = open(&cli)?;
+            let hits = s.find(&text.join(" "), anchor.as_deref(), scope.as_deref(), *k)?;
+            print_hits(&cli, &hits)
         }
         Cmd::Near { unit, k } => {
-            let store = open_store(&cli)?;
-            let u = resolve_unit(&store, unit)?;
-            let q = Query {
-                text: String::new(),
-                anchor: Some(u.id),
-                scope: None,
-                k_max: *k,
-                k_min: None,
-            };
-            print_hits(&cli, &search(&store, &q)?.hits)
+            let s = open(&cli)?;
+            print_hits(&cli, &s.near(unit, *k)?)
         }
         Cmd::Open { unit, out } => {
-            let store = open_store(&cli)?;
-            let mut u = resolve_unit(&store, unit)?;
-            if *out {
-                if let Some(p) = u.parent.clone() {
-                    u = store.unit(&p)?.context("parent missing")?;
+            let s = open(&cli)?;
+            let (u, children) = s.open(unit, *out)?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct Out<'a> {
+                    unit: &'a ubis_core::UnitRow,
+                    children: Vec<(&'a str, usize, usize, &'a str)>,
                 }
+                let children = children
+                    .iter()
+                    .map(|c| (c.id.as_str(), c.start_line, c.end_line, c.label.as_str()))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&Out { unit: &u, children })?);
+            } else {
+                print!("{}", Session::render_open(&u, &children));
             }
-            cmd_open(&cli, &store, &u)
+            Ok(())
         }
         Cmd::Refs { unit } => {
-            let store = open_store(&cli)?;
-            let u = resolve_unit(&store, unit)?;
-            let mut edges = Vec::new();
-            for s in store.subtree(&u.id)? {
-                edges.extend(store.edges_to(&s.id)?);
-            }
-            edges.sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.src.cmp(&b.src)));
+            let s = open(&cli)?;
+            let (u, edges) = s.refs(unit)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&edges)?);
-            } else if edges.is_empty() {
-                println!("no recorded references to {}", u.id);
             } else {
-                for e in edges {
-                    let src = store.unit(&e.src)?;
-                    let loc = src
-                        .map(|s| format!("{}:{}", s.path, e.line))
-                        .unwrap_or_default();
-                    println!(
-                        "{:<6} {:<9} w={:.2}  {}  ({})  → {}",
-                        e.kind.as_str(),
-                        e.origin,
-                        e.weight,
-                        e.src,
-                        loc,
-                        e.dst
-                    );
-                }
+                print!("{}", s.render_refs(&u, &edges)?);
             }
             Ok(())
         }
         Cmd::Status => {
-            let store = open_store(&cli)?;
-            let s = store.stats()?;
+            let s = open(&cli)?;
+            let st = s.store.stats()?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&s)?);
+                println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 println!(
-                    "files {}  units {} (leaves {})  definitions {}  mentions {}  edges {}",
-                    s.files, s.units, s.leaves, s.definitions, s.mentions, s.edges
+                    "root {}\nfiles {}  units {} (leaves {})  definitions {}  mentions {}  edges {}",
+                    s.root.display(),
+                    st.files,
+                    st.units,
+                    st.leaves,
+                    st.definitions,
+                    st.mentions,
+                    st.edges
                 );
             }
             Ok(())
@@ -170,7 +151,28 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_index(cli: &Cli, path: &Path, git: bool) -> Result<()> {
+/// Open the index and bring it up to date (unless `--no-refresh`).
+fn open(cli: &Cli) -> Result<Session> {
+    let mut s = Session::locate(cli.db.as_deref())?;
+    if !cli.no_refresh {
+        let r = s.refresh()?;
+        if r.changed() {
+            eprintln!("ubis: refreshed {r}");
+        }
+    }
+    Ok(s)
+}
+
+fn print_hits(cli: &Cli, hits: &[ubis_core::Hit]) -> Result<()> {
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(hits)?);
+    } else {
+        print!("{}", Session::render_hits(hits));
+    }
+    Ok(())
+}
+
+fn root_and_db(cli: &Cli, path: &Path) -> Result<(PathBuf, PathBuf)> {
     let root = path
         .canonicalize()
         .with_context(|| format!("{} does not exist", path.display()))?;
@@ -178,69 +180,31 @@ fn cmd_index(cli: &Cli, path: &Path, git: bool) -> Result<()> {
         bail!("{} is not a directory", root.display());
     }
     let db = cli.db.clone().unwrap_or_else(|| root.join(DB_DIR).join(DB_FILE));
-    let mut store = Store::open(&db)?;
-    let started = std::time::Instant::now();
-    let report = ubis_ingest::index_dir(&mut store, &root)?;
-    let mut git_note = String::new();
-    if git && ubis_git::is_repo(&root) {
-        git_note = index_git(&mut store, &root)?;
-    }
+    Ok((root, db))
+}
+
+fn cmd_index(cli: &Cli, path: &Path, git: bool) -> Result<()> {
+    let (root, db) = root_and_db(cli, path)?;
+    let mut s = Session::create(&root, &db)?;
+    let r = s.index(git, true)?;
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!("{}", serde_json::to_string_pretty(&r.files)?);
     } else {
-        println!(
-            "indexed {} in {:.2}s — added {}, updated {}, unchanged {}, removed {}, skipped {}; edges {}{}",
-            root.display(),
-            started.elapsed().as_secs_f64(),
-            report.added,
-            report.updated,
-            report.unchanged,
-            report.removed,
-            report.skipped,
-            report.edges,
-            git_note
-        );
+        println!("indexed {} in {r}", root.display());
         println!("db: {}", db.display());
     }
     Ok(())
 }
 
-/// Record git history and derive co-change, unless HEAD and the indexed
-/// files are unchanged since the last run (then the rows would be identical).
-fn index_git(store: &mut Store, root: &Path) -> Result<String> {
-    use ubis_ingest::history::{git_basis, History, BASIS_KEY};
-    let basis = git_basis(store, root)?;
-    if store.meta(BASIS_KEY)?.as_deref() == Some(basis.as_str()) {
-        return Ok("; git history unchanged".into());
-    }
-    let history = ubis_git::history(root, "HEAD", 5000)?;
-    let now = history.last().map(|c| c.ts).unwrap_or(0);
-    let params = ubis_core::cochange::CoChangeParams::at(now);
-    let pairs = History::open(root)?.record_and_derive(store, &history, &params)?;
-    store.set_meta(BASIS_KEY, &basis)?;
-    Ok(format!("; commits {}, co-change pairs {pairs}", history.len()))
-}
-
 fn cmd_watch(cli: &Cli, path: &Path, debounce_ms: u64) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
-    use std::collections::BTreeSet;
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("{} does not exist", path.display()))?;
-    let db = cli.db.clone().unwrap_or_else(|| root.join(DB_DIR).join(DB_FILE));
-    let mut store = Store::open(&db)?;
-    let r = ubis_ingest::index_dir(&mut store, &root)?;
-    println!(
-        "watching {} — initial: added {}, updated {}, removed {}; edges {}",
-        root.display(),
-        r.added,
-        r.updated,
-        r.removed,
-        r.edges
-    );
+    let (root, db) = root_and_db(cli, path)?;
+    let mut s = Session::create(&root, &db)?;
+    let r = s.index(true, true)?;
+    println!("watching {} — initial: {r}", root.display());
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -257,145 +221,16 @@ fn cmd_watch(cli: &Cli, path: &Path, debounce_ms: u64) -> Result<()> {
         while let Ok(more) = rx.recv_timeout(Duration::from_millis(debounce_ms)) {
             paths.extend(more);
         }
-        let changed: BTreeSet<String> = paths
-            .into_iter()
-            .filter(|p| db_dir.as_ref().is_none_or(|d| !p.starts_with(d)))
-            .filter_map(|p| {
-                p.strip_prefix(&root).ok().map(|rel| {
-                    rel.components()
-                        .map(|c| c.as_os_str().to_string_lossy().to_string())
-                        .collect::<Vec<_>>()
-                        .join("/")
-                })
-            })
-            .filter(|rel| !rel.is_empty())
-            .collect();
-        if changed.is_empty() {
+        // Ignore our own writes; anything else (including `.git`, so commits
+        // and checkouts re-derive history) triggers a refresh. Unchanged
+        // files are skipped by stat, so this stays cheap.
+        if paths.iter().all(|p| db_dir.as_ref().is_some_and(|d| p.starts_with(d))) {
             continue;
         }
-        let started = std::time::Instant::now();
-        match ubis_ingest::index_paths(&mut store, &root, &changed) {
-            Ok(r) if r.added + r.updated + r.removed > 0 => println!(
-                "{} path(s) → added {}, updated {}, removed {}; edges {} ({} ms)",
-                changed.len(),
-                r.added,
-                r.updated,
-                r.removed,
-                r.edges,
-                started.elapsed().as_millis()
-            ),
+        match s.refresh() {
+            Ok(r) if r.changed() => println!("{r}"),
             Ok(_) => {}
             Err(e) => eprintln!("update failed: {e:#}"),
         }
     }
-}
-
-fn open_store(cli: &Cli) -> Result<Store> {
-    let db = match &cli.db {
-        Some(p) => p.clone(),
-        None => find_db(&std::env::current_dir()?)
-            .context("no .ubis/index.db found here or above; run `ubis index` first")?,
-    };
-    Store::open(&db)
-}
-
-fn find_db(start: &Path) -> Option<PathBuf> {
-    let mut cur = Some(start);
-    while let Some(dir) = cur {
-        let p = dir.join(DB_DIR).join(DB_FILE);
-        if p.exists() {
-            return Some(p);
-        }
-        cur = dir.parent();
-    }
-    None
-}
-
-fn resolve_unit(store: &Store, reference: &str) -> Result<UnitRow> {
-    let matches = store.find_unit(reference)?;
-    match matches.len() {
-        0 => bail!("no unit matches `{reference}`"),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        _ => {
-            let exact: Vec<_> = matches.iter().filter(|u| u.id == reference).collect();
-            if let Some(u) = exact.first() {
-                return Ok((*u).clone());
-            }
-            let list: Vec<_> = matches.iter().take(10).map(|u| u.id.as_str()).collect();
-            bail!("`{reference}` is ambiguous:\n  {}", list.join("\n  "))
-        }
-    }
-}
-
-fn print_hits(cli: &Cli, hits: &[Hit]) -> Result<()> {
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(hits)?);
-        return Ok(());
-    }
-    if hits.is_empty() {
-        println!("no candidates");
-    }
-    for (i, h) in hits.iter().enumerate() {
-        let lifted = if h.lifted > 0 {
-            format!("  [{} matches inside]", h.lifted)
-        } else {
-            String::new()
-        };
-        println!(
-            "[{}] {}:{}-{}  {}  ({}){}",
-            i + 1,
-            h.path,
-            h.start_line,
-            h.end_line,
-            h.id,
-            h.kind.as_str(),
-            lifted
-        );
-        if !h.signature.is_empty() {
-            println!("    {}", h.signature);
-        }
-        let via: Vec<_> = h
-            .via
-            .iter()
-            .map(|v| format!("{} {:.2}", v.op, v.contribution))
-            .collect();
-        println!("    via {}", via.join(", "));
-    }
-    Ok(())
-}
-
-fn cmd_open(cli: &Cli, store: &Store, u: &UnitRow) -> Result<()> {
-    let children = store.children(&u.id)?;
-    if cli.json {
-        #[derive(serde::Serialize)]
-        struct Out<'a> {
-            unit: &'a UnitRow,
-            children: Vec<(&'a str, usize, usize, &'a str)>,
-        }
-        let out = Out {
-            unit: u,
-            children: children
-                .iter()
-                .map(|c| (c.id.as_str(), c.start_line, c.end_line, c.label.as_str()))
-                .collect(),
-        };
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-    println!("{}:{}-{}  {}  ({})", u.path, u.start_line, u.end_line, u.id, u.kind.as_str());
-    if let Some(p) = &u.parent {
-        println!("parent: {p}");
-    }
-    if children.is_empty() {
-        println!("---");
-        for (i, line) in u.text.lines().enumerate() {
-            println!("{:>5}  {}", u.start_line + i, line);
-        }
-    } else {
-        println!("children:");
-        for c in children {
-            println!("  {:>5}-{:<5} {}  ({})", c.start_line, c.end_line, c.id, c.kind.as_str());
-        }
-    }
-    Ok(())
 }

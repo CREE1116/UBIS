@@ -138,6 +138,9 @@ pub struct Definition {
 pub enum MentionKind {
     /// A call-shaped reference in code.
     Call,
+    /// A method call on a receiver of unknown type (`x.len()`): it may just
+    /// as well target a method outside the project.
+    Method,
     /// A type reference in code.
     Type,
     /// An imported name.
@@ -152,6 +155,7 @@ impl MentionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             MentionKind::Call => "call",
+            MentionKind::Method => "method",
             MentionKind::Type => "type",
             MentionKind::Import => "import",
             MentionKind::Link => "link",
@@ -161,6 +165,7 @@ impl MentionKind {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "call" => MentionKind::Call,
+            "method" => MentionKind::Method,
             "type" => MentionKind::Type,
             "import" => MentionKind::Import,
             "link" => MentionKind::Link,

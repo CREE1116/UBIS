@@ -12,6 +12,10 @@
 //! * `bridge` mentions (identifiers in prose) match code symbols only, and are
 //!   dropped when the name is too ambiguous to be a useful signal.
 //!
+//! * `method` mentions (`x.len()`, receiver type unknown) resolve like calls,
+//!   but one extra share is reserved for "a method outside the project", so a
+//!   lone local `len` gets 1/2, not a certain edge from every `.len()`.
+//!
 //! An ambiguous mention with `m` candidates contributes `1/m` to each. Mass is
 //! split instead of discarded because UBIS narrows candidates for an agent; it
 //! does not claim a resolved call graph.
@@ -59,7 +63,7 @@ pub fn resolve(defs: &[(Definition, String)], mentions: &[(Mention, String)]) ->
                 }
                 (code, "bridge")
             }
-            MentionKind::Call | MentionKind::Type | MentionKind::Import => {
+            MentionKind::Call | MentionKind::Method | MentionKind::Type | MentionKind::Import => {
                 let symbols: Vec<_> = cands
                     .iter()
                     .filter(|(d, _)| d.kind == DefKind::Symbol)
@@ -83,7 +87,8 @@ pub fn resolve(defs: &[(Definition, String)], mentions: &[(Mention, String)]) ->
         if targets.is_empty() {
             continue;
         }
-        let w = 1.0 / targets.len() as f64;
+        let external = usize::from(m.kind == MentionKind::Method);
+        let w = 1.0 / (targets.len() + external) as f64;
         for d in targets {
             let entry = acc
                 .entry((m.unit_id.clone(), d.unit_id.clone(), m.kind))
@@ -141,6 +146,17 @@ mod tests {
         let e = resolve(&defs, &ms);
         assert_eq!(e.len(), 2);
         assert!(e.iter().all(|e| (e.weight - 0.5).abs() < 1e-12 && e.origin == "global"));
+    }
+
+    /// `x.iter()` with a lone local `iter`: half the mass stays reserved for
+    /// methods outside the project.
+    #[test]
+    fn unknown_receiver_reserves_external_share() {
+        let defs = vec![def("a.rs::Index::iter", "iter", DefKind::Symbol, "a.rs")];
+        let ms = vec![men("b.rs::run", "iter", MentionKind::Method, "b.rs")];
+        let e = resolve(&defs, &ms);
+        assert_eq!(e.len(), 1);
+        assert!((e[0].weight - 0.5).abs() < 1e-12);
     }
 
     #[test]

@@ -13,9 +13,10 @@
 //! always recomputable from `commits` + `hunks`; it is stored in the derived
 //! `cochange` table (like `edges`) and read by the [`CoChange`] operator.
 //!
-//! Unit IDs are those of the index at build time. Files edited afterwards may
-//! leave rows pointing at IDs that no longer exist; the cascade drops those,
-//! and the next `ubis index --git` rebuilds the table.
+//! Unit IDs are those of the index at build time. Between commits, edited
+//! files may leave rows pointing at IDs that no longer exist; the cascade
+//! drops those. The table is re-derived when `HEAD` moves (every query checks)
+//! and by an explicit `ubis index`.
 
 use std::collections::{BTreeMap, BTreeSet};
 

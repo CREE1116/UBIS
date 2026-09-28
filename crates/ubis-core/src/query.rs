@@ -254,9 +254,7 @@ impl Operator for RefsOut {
         for a in &ctx.anchor_set {
             for e in store.edges_from(a)? {
                 if !ctx.anchor_set.contains(&e.dst) {
-                    // A target everyone references says little about this anchor.
-                    let spec = if SPECIFICITY { specificity(store.in_degree(&e.dst)?) } else { 1.0 };
-                    *scores.entry(e.dst).or_default() += e.weight * spec;
+                    *scores.entry(e.dst).or_default() += e.weight;
                 }
             }
         }
@@ -278,9 +276,7 @@ impl Operator for RefsIn {
         for a in &ctx.anchor_set {
             for e in store.edges_to(a)? {
                 if !ctx.anchor_set.contains(&e.src) {
-                    // A caller that references everything says little about this anchor.
-                    let spec = if SPECIFICITY { specificity(store.out_degree(&e.src)?) } else { 1.0 };
-                    *scores.entry(e.src).or_default() += e.weight * spec;
+                    *scores.entry(e.src).or_default() += e.weight;
                 }
             }
         }
@@ -343,14 +339,6 @@ impl Operator for SameFile {
     }
 }
 
-/// Degree discount on refs (REPORT.md E8): mixed results, not adopted.
-pub const SPECIFICITY: bool = false;
-
-/// IDF-like discount for a unit with `degree` edges on the other side.
-fn specificity(degree: usize) -> f64 {
-    1.0 / (1.0 + (degree as f64).ln_1p())
-}
-
 fn top(scores: HashMap<UnitId, f64>, limit: usize) -> Vec<(UnitId, f64)> {
     let mut v: Vec<_> = scores.into_iter().filter(|(_, s)| *s > 0.0).collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -387,7 +375,7 @@ pub fn plan(q: &Query) -> Plan {
         ops.push((Box::new(RefsOut { limit: 50 }), 0.8));
         ops.push((Box::new(TreeNear { limit: 30 }), 0.3));
         ops.push((Box::new(SameFile { limit: 30 }), 0.2));
-        // Empty without git history (`ubis index --git`); measured in REPORT.md E1.
+        // Empty outside git repositories; measured in REPORT.md E1.
         ops.push((Box::new(CoChange { limit: 50 }), 0.5));
     }
     Plan { ops }

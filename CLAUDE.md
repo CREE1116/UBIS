@@ -66,7 +66,7 @@ integrations/skills/ubis/SKILL.md   에이전트용 사용법
 
 ```bash
 cargo build --release
-./target/release/ubis index . && ./target/release/ubis find "..."
+./target/release/ubis find "..."        # 첫 호출이 색인을 만들고, 이후 자동 갱신
 ./target/release/ubis-bench <repo> --holdout 200 --max-commits 900          # 기본
 ./target/release/ubis-bench <repo> --disable same_file                      # ablation
 ./target/release/ubis-bench <repo> --weight lexical=0.5 --k-min 10 -v       # 가중치, 컷, 질의별 출력
@@ -76,7 +76,9 @@ cargo build --release
 
 ## 6. 현재 상태 (v0)
 
-**된 것:** unit 트리와 구조적 ID, gap leaf, SQLite 증거 저장소, 증분 색인, watch, mention→edge 해석(질량 분할, 타입 한정 호출), BM25 + symbol + path(E7) + refs + tree_near + same_file + co-change(E1, `ubis index --git`), 적응형 $K$, 시간 분할 하네스(하네스와 CLI가 같은 hunk→unit 매핑 코드를 쓴다).
+**된 것:** unit 트리와 구조적 ID, gap leaf, SQLite 증거 저장소, 증분 색인(stat 캐시로 미변경 파일은 읽지 않음), 매 질의 전 자동 갱신(파일 항상, git 이력은 HEAD가 움직일 때), git 레포에서 첫 호출 시 자동 색인, `path:line` anchor, watch, mention→edge 해석(질량 분할, 타입 한정 호출, 수신 타입 모르는 메서드 호출은 외부 몫 1 예약), BM25 + symbol + path(E7) + refs + tree_near + same_file + co-change(E1), 적응형 $K$, 시간 분할·PR 태스크 하네스(하네스와 CLI가 같은 hunk→unit 매핑 코드를 쓴다).
+
+**설계 선호: 사용자와 에이전트가 알아야 할 것을 최소로.** 명령 두 개(`find`, `near`)면 되게 한다. 수동 단계(색인)는 자동으로 대체하고, 기각된 실험은 플래그로 남기지 말고 코드에서 지운다(기록은 REPORT.md). 새 인터페이스(MCP 등)는 스킬 + CLI로 안 될 때만.
 
 **측정으로 확인된 것** (REPORT.md):
 - **PR 태스크(실제 작업 질의)**: `find->near` 2-call이 fd·ripgrep·requests에서 grep → 파일 3개 읽기와 recall 동등 이상, 토큰 1/8~1/22. flask만 0.309 vs 0.327. 남은 실패의 주원인은 설명 어휘 ≠ 코드 어휘(E2 동기).
@@ -129,7 +131,7 @@ cargo build --release
 - 지표: recall과 read_tok의 파레토 곡선. $K$ 고정 상한과의 격차.
 
 ### E7. path operator — **채택됨** (제목 term ↔ 파일 경로, lexical × 0.5)
-### E8. refs 차수 할인 — 기각 (`SPECIFICITY = false`, REPORT.md)
+### E8. refs 차수 할인, E9. noisy-OR 엣지 결합 — 기각 (코드 제거, 기록은 REPORT.md)
 
 ### E5. Planner 라우팅
 - 질의 형태 판정(식별자형 / 자연어 / anchor 유무)에 따른 $w$ 조정. 한국어 질의, 경로형 질의(`src/..`), 에러 메시지형 질의 규칙 추가.

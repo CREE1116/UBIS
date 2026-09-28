@@ -53,28 +53,24 @@ $$\mathbb{E}[\text{cost}] = K\cdot t_{\text{cand}} + \sum_{\text{열람}}|\text{
 ## 빠른 시작
 
 ```bash
-# 설치
-cargo install --path crates/ubis-cli        # → ubis
-cargo install --path crates/ubis-bench      # → ubis-bench (평가용, 선택)
+cargo install --path crates/ubis-cli
 
-# 색인
 cd ~/my-project
-ubis index --git .      # 파일 + git 이력(co-change)까지. .ubis/index.db 생성
-ubis status             # files 27  units 441 (leaves 346)  definitions 345  mentions 3002  edges 662
-
-# 검색
-ubis find "토큰 만료 처리"
+ubis find "토큰 만료 처리"          # 찾기
+ubis near src/auth/token.rs:42     # 이 줄 주변에서 같이 봐야 할 곳
 ```
+
+이게 전부다. 따로 색인할 필요가 없다.
+
+- git 레포에서 처음 실행하면 레포 루트에 `.ubis/`를 만들고 파일과 git 이력을 색인한다. `.ubis/`는 자체 `.gitignore`를 가져서 `git status`에 뜨지 않는다.
+- 이후에는 매 호출 전에 바뀐 파일만 다시 읽는다. 크기·수정 시각이 같으면 읽지 않고, 커밋이 생기면 이력을 다시 파생한다.
+- git 밖의 폴더는 `ubis index <dir>`로 한 번 만들어 둔다.
 
 | ripgrep (221 파일, 903 커밋) | 시간 |
 |---|---:|
-| 첫 `ubis index --git .` | 4.3s |
-| 변경 없이 재실행 (HEAD·파일 동일 → 이력 재계산 생략) | 0.03s |
-| `ubis near …` 질의 | 9ms |
-
-git 이력은 `commits` / `hunks` / `commit_blobs`로 기록되고, co-change는 **기록된 증거에서** 파생된다. git은 기록된 blob id의 내용을 다시 읽을 때만 쓴다.
-
-색인은 증분이다. 다시 실행하면 바뀐 파일만 재추출한다. 편집 중에는 `ubis watch .`로 파일 이벤트를 따라가게 둘 수 있다.
+| 첫 호출 (색인 + 이력) | 4~5s |
+| 이후 호출의 자동 갱신 (변경 없음) | 10~20ms |
+| `find` / `near` 질의 | 10ms 안팎 |
 
 ---
 
@@ -99,8 +95,8 @@ ubis find "adaptive cut K"
 ### 2. 지금 보는 unit 주변 — `near`
 
 ```bash
-# sharkdp/fd 레포, `ubis index --git .` 후
-ubis near src/exec/job.rs::batch -k 8
+# sharkdp/fd 레포에서
+ubis near src/exec/job.rs::batch -k 8      # src/exec/job.rs:50 처럼 줄 번호로 줘도 된다
 ```
 
 ```text
@@ -117,7 +113,7 @@ ubis near src/exec/job.rs::batch -k 8
     via refs_out 0.80
 ```
 
-anchor만 주면 이동이 된다. 이 unit을 참조하는 곳, 이 unit이 참조하는 곳, 형제 unit, 같은 파일의 다른 unit, 그리고 **과거 커밋에서 같이 바뀐 unit**(`--git`으로 색인했을 때)이 후보로 나온다.
+anchor만 주면 이동이 된다. 이 unit을 참조하는 곳, 이 unit이 참조하는 곳, 형제 unit, 같은 파일의 다른 unit, 그리고 **과거 커밋에서 같이 바뀐 unit**이 후보로 나온다.
 
 ### 3. anchor + 설명 — `find --anchor`
 
@@ -150,7 +146,9 @@ ubis find "retry backoff" --scope src/net/ -k 5
 ubis find "retry backoff" --json | jq '.[0]'
 ```
 
-unit 참조는 전체 ID(`src/store.rs::Store::open`), 라벨, `::` 접미사(`Store::open`) 중 무엇이든 된다.
+unit은 `path:line`(`src/store.rs:120`), 전체 ID(`src/store.rs::Store::open`), 이름(`Store::open`) 중 무엇으로든 가리킬 수 있다. 이름이 여러 unit에 맞으면 후보 목록을 보여주고 멈춘다.
+
+그 밖의 명령: `ubis index <dir>`(git 밖 폴더, 또는 명시적 전체 재계산), `ubis watch <dir>`(파일 이벤트로 계속 갱신), `ubis status`. 전역 옵션 `--json`, `--no-refresh`.
 
 ---
 
@@ -299,7 +297,7 @@ flowchart TB
 | Rust, Python, Java (tree-sitter) | 모듈 › 타입/impl/클래스 › 함수/메서드, 남는 줄은 gap | 심볼 (+ `Owner::method`) | 호출, 타입 참조, import |
 | Markdown | heading 계층 › 문단 / 코드 블록 | GitHub식 anchor | `[t](#a)`, `[t](x.md#a)`, `[[wiki]]`, 문장 속 식별자 |
 | 텍스트 (`.txt`, `.tex`, `.rst`, 기타 코드) | 문단 | 파일 | 문장 속 식별자 |
-| git 이력 (`--git`) | — | — | 커밋 hunk → co-change |
+| git 이력 (git 레포면 자동) | — | — | 커밋 hunk → co-change |
 
 읽을 수 있는 UTF-8 텍스트만 받는다. 바이너리·이미지·Office·PDF는 제외한다.
 

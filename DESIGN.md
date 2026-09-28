@@ -13,7 +13,8 @@ $$\mathbb{E}[\text{cost}] = K\cdot t_{\text{cand}} + \sum_{\text{열람}}|\text{
 ## 층
 
 ```
-Interface   ubis CLI (find / near / refs / open / status), 에이전트 스킬
+Interface   ubis CLI (find / near 가 전부; refs / open / index / watch / status), 에이전트 스킬
+            매 호출 전 자동 갱신: stat 캐시로 바뀐 파일만 읽고, HEAD가 움직였을 때만 이력 재파생
 Query       Planner → Stage A 후보 생성 → Stage B 점수 → Stage C 성형
 Derivation  Resolver (mentions ⋈ definitions → edges)   [실험: Factorizer]
 Evidence    SQLite: files, units, postings, definitions, mentions, commits, hunks, commit_blobs
@@ -36,7 +37,8 @@ Ingest      walker(.gitignore) → 텍스트 판별 → extractor → 파일 단
 - `call`/`type`/`import`: 같은 파일 정의 우선(`same_file`), 없으면 같은 이름 전체(`global`).
 - 타입 한정 호출(`Store::open()`, `Self::open()`, `self.open()`)은 `Owner::method` 정의에만 매칭한다. `Vec::new()`가 로컬 `new`로 새지 않는다. 모듈 경로(`bm25::f`)는 소문자 관례로 구분해 단순 이름으로 해석한다.
 - `bridge`: 문장·백틱 속 식별자 → 다른 파일의 코드 심볼. 후보가 3개를 넘으면 버린다.
-- 후보 $m$개면 각 $1/m$ 질량. 같은 (src, dst, kind)는 합산.
+- `method`: 수신 타입을 모르는 호출(`x.len()`, Python `obj.f()`, Java `x.f()`). `call`처럼 해석하되 "프로젝트 밖 메서드" 몫 1을 예약해 후보 $m$개면 각 $1/(m+1)$. 로컬 `len` 하나가 모든 `.len()`의 확정 대상이 되지 않는다.
+- 후보 $m$개면 각 $1/m$ 질량. 같은 (src, dst, kind)는 합산(noisy-OR 결합은 측정 후 기각, REPORT.md E9).
 
 ## 질의 cascade
 
@@ -48,7 +50,7 @@ Ingest      walker(.gitignore) → 텍스트 판별 → extractor → 파일 단
 | `refs_in` / `refs_out` | anchor로 들어오는/나가는 엣지 질량 | 방향 있음 |
 | `tree_near` | anchor 형제, 문서 순서 거리 $1/(1+d)$ | |
 | `same_file` | anchor 파일의 다른 leaf, $1/(1+d/4)$ | 파일 내부 co-change를 unit 단위로 |
-| `cochange` | 파생 테이블 `cochange`의 질량 (아래) | `ubis index --git`일 때만 채워짐 |
+| `cochange` | 파생 테이블 `cochange`의 질량 (아래) | git 레포에서만 채워짐 |
 
 - **Planner**: 식별자형 질의 → `symbol` 가중; anchor 있음 → 관계 operator + 텍스트는 0.25로 낮춤(하네스로 측정해 정함).
 - **Stage B**: $\phi_f = \text{raw}_f/\max\text{raw}_f$, $s=\sum_f w_f\phi_f$. 점수 간격을 보존해야 적응형 $K$가 의미 있다.
