@@ -265,7 +265,13 @@ pub fn plan(q: &Query) -> Plan {
         !words.is_empty() && words.len() <= 3 && words.iter().any(|w| is_identifier_shaped(w));
     let mut ops: Vec<(Box<dyn Operator>, f64)> = Vec::new();
     if !words.is_empty() {
-        let (lex, sym) = if identifier_query { (1.0, 1.2) } else { (1.0, 0.3) };
+        // With an anchor, the anchor is the stronger evidence; text refines.
+        // (Measured with ubis-bench: text at full weight drowned anchor signals.)
+        let (lex, sym) = match (q.anchor.is_some(), identifier_query) {
+            (true, _) => (0.25, 0.25),
+            (false, true) => (1.0, 1.2),
+            (false, false) => (1.0, 0.3),
+        };
         ops.push((Box::new(Lexical::default()), lex));
         ops.push((Box::new(Symbol { limit: 50 }), sym));
     }

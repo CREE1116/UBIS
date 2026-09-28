@@ -164,8 +164,9 @@ impl<'a> UnitTree<'a> {
                 covered[start] = true;
             }
             for (s, e) in &children[&id] {
-                for l in (*s).max(start)..=(*e).min(end) {
-                    covered[l] = true;
+                let (a, b) = ((*s).max(start), (*e).min(end));
+                if a <= b {
+                    covered[a..=b].fill(true);
                 }
             }
             let mut runs: Vec<(usize, usize)> = Vec::new();

@@ -17,6 +17,9 @@ use crate::tokenize::tokenize;
 
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// `(commit id, unix time, subject, [(path, start line, line count)])`.
+pub type CommitRow = (String, i64, String, Vec<(String, usize, usize)>);
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
@@ -389,7 +392,7 @@ impl Store {
 
     // ---------------------------------------------------------------- git
 
-    pub fn replace_history(&mut self, commits: &[(String, i64, String, Vec<(String, usize, usize)>)]) -> Result<()> {
+    pub fn replace_history(&mut self, commits: &[CommitRow]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM commits", [])?;
         tx.execute("DELETE FROM hunks", [])?;
