@@ -93,8 +93,8 @@ fn main() -> Result<()> {
         Cmd::Watch { path, debounce_ms } => cmd_watch(&cli, path, *debounce_ms),
         Cmd::Find { text, anchor, scope, k } => {
             let s = open(&cli)?;
-            let hits = s.find(&text.join(" "), anchor.as_deref(), scope.as_deref(), *k)?;
-            print_hits(&cli, &hits)
+            let resp = s.find(&text.join(" "), anchor.as_deref(), scope.as_deref(), *k)?;
+            print_hits(&cli, &resp)
         }
         Cmd::Near { unit, k } => {
             let s = open(&cli)?;
@@ -163,11 +163,16 @@ fn open(cli: &Cli) -> Result<Session> {
     Ok(s)
 }
 
-fn print_hits(cli: &Cli, hits: &[ubis_core::Hit]) -> Result<()> {
+fn print_hits(cli: &Cli, r: &ubis_core::Response) -> Result<()> {
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(hits)?);
+        #[derive(serde::Serialize)]
+        struct Out<'a> {
+            hits: &'a [ubis_core::Hit],
+            tests: &'a [ubis_core::Hit],
+        }
+        println!("{}", serde_json::to_string_pretty(&Out { hits: &r.hits, tests: &r.tests })?);
     } else {
-        print!("{}", Session::render_hits(hits));
+        print!("{}", Session::render_response(r));
     }
     Ok(())
 }

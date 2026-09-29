@@ -12,13 +12,14 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::cochange::CoChangeIndex;
+use crate::fields;
 use crate::model::*;
 use crate::resolve;
 use crate::tokenize::tokenize;
 
 /// Bump when stored rows would differ for the same input (schema or
 /// tokenizer changes); older indexes are then reset and rebuilt.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// One commit as recorded evidence. `blobs` are the post-commit object ids of
 /// changed paths: content-addressed pointers, so a hunk's file can be re-read
@@ -28,6 +29,8 @@ pub struct CommitRow {
     pub id: String,
     pub ts: i64,
     pub subject: String,
+    pub body: String,
+    pub merge: bool,
     /// `(path, start line, line count)` against the post-commit file.
     pub hunks: Vec<(String, usize, usize)>,
     /// `(path, blob id)`.
@@ -59,6 +62,11 @@ CREATE INDEX IF NOT EXISTS units_parent ON units(parent);
 CREATE TABLE IF NOT EXISTS postings(term TEXT NOT NULL, unit_id TEXT NOT NULL, tf REAL NOT NULL, path TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS postings_term ON postings(term);
 CREATE INDEX IF NOT EXISTS postings_path ON postings(path);
+CREATE TABLE IF NOT EXISTS fpostings(field TEXT NOT NULL, term TEXT NOT NULL, doc TEXT NOT NULL, tf REAL NOT NULL, path TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS fpostings_term ON fpostings(field, term);
+CREATE INDEX IF NOT EXISTS fpostings_path ON fpostings(path);
+CREATE TABLE IF NOT EXISTS fdocs(field TEXT NOT NULL, doc TEXT NOT NULL, len REAL NOT NULL, path TEXT NOT NULL, PRIMARY KEY(field, doc));
+CREATE INDEX IF NOT EXISTS fdocs_path ON fdocs(path);
 CREATE TABLE IF NOT EXISTS definitions(unit_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS definitions_name ON definitions(name);
 CREATE INDEX IF NOT EXISTS definitions_name_nocase ON definitions(name COLLATE NOCASE);
@@ -72,7 +80,11 @@ CREATE TABLE IF NOT EXISTS edges(
 );
 CREATE INDEX IF NOT EXISTS edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
-CREATE TABLE IF NOT EXISTS commits(id TEXT PRIMARY KEY, ts INTEGER NOT NULL, subject TEXT NOT NULL, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS commits(id TEXT PRIMARY KEY, ts INTEGER NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, merge INTEGER NOT NULL, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS hist_postings(term TEXT NOT NULL, unit_id TEXT NOT NULL, tf REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS hist_postings_term ON hist_postings(term);
+CREATE TABLE IF NOT EXISTS hist_docs(unit_id TEXT PRIMARY KEY, len REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS unit_changes(unit_id TEXT NOT NULL, commit_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hunks(commit_id TEXT NOT NULL, path TEXT NOT NULL, start_line INTEGER NOT NULL, len INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS hunks_commit ON hunks(commit_id);
 CREATE TABLE IF NOT EXISTS stat_cache(path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, checked_ns INTEGER NOT NULL);
@@ -281,12 +293,38 @@ impl Store {
 
     // ----------------------------------------------------------------- edges
 
-    /// Recompute all edges from mentions ⋈ definitions.
+    /// Recompute everything derived from mentions ⋈ definitions: the edges
+    /// and the file-level `tests` field.
     pub fn rebuild_edges(&mut self) -> Result<usize> {
         let defs = self.all_definitions()?;
         let mentions = self.all_mentions()?;
         let edges = resolve::resolve(&defs, &mentions);
+        let test_units = self.test_units()?;
+        let mentioners: HashMap<UnitId, fields::Mentioner<'_>> = test_units
+            .iter()
+            .map(|u| {
+                let m = fields::Mentioner { label: &u.label, text: &u.text, start_line: u.start_line };
+                (u.id.clone(), m)
+            })
+            .collect();
+        let tests = fields::test_field(&defs, &mentions, &mentioners);
+        let files = self.file_paths()?;
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM fpostings WHERE field=?1", [fields::TESTS])?;
+        tx.execute("DELETE FROM fdocs WHERE field=?1", [fields::TESTS])?;
+        {
+            let mut p = tx.prepare("INSERT INTO fpostings(field, term, doc, tf, path) VALUES(?1,?2,?3,?4,?3)")?;
+            let mut d = tx.prepare("INSERT INTO fdocs(field, doc, len, path) VALUES(?1,?2,?3,?2)")?;
+            // Every file is a document (length 0 when no test mentions it).
+            for f in &files {
+                let terms = tests.get(f);
+                let len: f64 = terms.map_or(0.0, |t| t.values().sum());
+                d.execute(params![fields::TESTS, f, len])?;
+                for (term, tf) in terms.into_iter().flatten() {
+                    p.execute(params![fields::TESTS, term, f, tf])?;
+                }
+            }
+        }
         tx.execute("DELETE FROM edges", [])?;
         {
             let mut stmt = tx.prepare(
@@ -494,11 +532,13 @@ impl Store {
         tx.execute("DELETE FROM hunks", [])?;
         tx.execute("DELETE FROM commit_blobs", [])?;
         {
-            let mut c = tx.prepare("INSERT OR REPLACE INTO commits(id, ts, subject, seq) VALUES(?1,?2,?3,?4)")?;
+            let mut c = tx.prepare(
+                "INSERT OR REPLACE INTO commits(id, ts, subject, body, merge, seq) VALUES(?1,?2,?3,?4,?5,?6)",
+            )?;
             let mut h = tx.prepare("INSERT INTO hunks(commit_id, path, start_line, len) VALUES(?1,?2,?3,?4)")?;
             let mut b = tx.prepare("INSERT INTO commit_blobs(commit_id, path, blob) VALUES(?1,?2,?3)")?;
             for (seq, c_row) in commits.iter().enumerate() {
-                c.execute(params![c_row.id, c_row.ts, c_row.subject, seq as i64])?;
+                c.execute(params![c_row.id, c_row.ts, c_row.subject, c_row.body, c_row.merge as i64, seq as i64])?;
                 for (path, start, len) in &c_row.hunks {
                     h.execute(params![c_row.id, path, *start as i64, *len as i64])?;
                 }
@@ -509,6 +549,108 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replace the derived history field: per unit, the term counts of the
+    /// commit messages that changed it (`docs`: unit → (terms, length)).
+    pub fn replace_history_field(&mut self, docs: &BTreeMap<UnitId, (BTreeMap<String, f64>, f64)>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM hist_postings", [])?;
+        tx.execute("DELETE FROM hist_docs", [])?;
+        {
+            let mut p = tx.prepare("INSERT INTO hist_postings(term, unit_id, tf) VALUES(?1,?2,?3)")?;
+            let mut d = tx.prepare("INSERT INTO hist_docs(unit_id, len) VALUES(?1,?2)")?;
+            for (unit, (terms, len)) in docs {
+                d.execute(params![unit, len])?;
+                for (term, tf) in terms {
+                    p.execute(params![term, unit, tf])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the derived unit → commit mapping (which recorded commits
+    /// touched each current unit).
+    pub fn replace_unit_changes(&mut self, pairs: &[(UnitId, String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM unit_changes", [])?;
+        {
+            let mut st = tx.prepare("INSERT INTO unit_changes(unit_id, commit_id) VALUES(?1,?2)")?;
+            for (u, c) in pairs {
+                st.execute(params![u, c])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Postings of the history field: `(unit_id, tf, len, path)`. Units that
+    /// no longer exist are dropped by the join.
+    pub fn hist_postings(&self, term: &str) -> Result<Vec<(UnitId, f64, f64, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.unit_id, p.tf, d.len, u.path FROM hist_postings p \
+             JOIN hist_docs d ON d.unit_id = p.unit_id JOIN units u ON u.id = p.unit_id WHERE p.term=?1",
+        )?;
+        let rows = stmt.query_map([term], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// `(documents, average length)` of the history field.
+    pub fn hist_stats(&self) -> Result<(usize, f64)> {
+        Ok(self.conn.query_row("SELECT COUNT(*), COALESCE(AVG(len), 0) FROM hist_docs", [], |r| {
+            Ok((r.get::<_, i64>(0)? as usize, r.get(1)?))
+        })?)
+    }
+
+    /// Postings of a derived field: `(doc, tf, doc length, path)`. Unit
+    /// documents that no longer exist are dropped by the join.
+    pub fn field_postings(&self, field: &str, term: &str) -> Result<Vec<(String, f64, f64, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.doc, p.tf, d.len, p.path FROM fpostings p \
+             JOIN fdocs d ON d.field = p.field AND d.doc = p.doc WHERE p.field=?1 AND p.term=?2",
+        )?;
+        let rows = stmt.query_map([field, term], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Collection statistics of a field for DPH: `(documents, total length)`.
+    /// Every leaf is a document of a unit field (empty ones included), every
+    /// file a document of the `tests` field.
+    pub fn field_totals(&self, field: &str) -> Result<(f64, f64)> {
+        let c = &self.conn;
+        let leaves: f64 = c.query_row("SELECT COUNT(*) FROM units WHERE is_leaf=1", [], |r| r.get::<_, i64>(0))? as f64;
+        Ok(match field {
+            "code" => (leaves, c.query_row("SELECT COALESCE(SUM(len),0) FROM units WHERE is_leaf=1", [], |r| r.get(0))?),
+            "history" => (
+                leaves,
+                c.query_row(
+                    "SELECT COALESCE(SUM(d.len),0) FROM hist_docs d JOIN units u ON u.id = d.unit_id",
+                    [],
+                    |r| r.get(0),
+                )?,
+            ),
+            _ => c.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(len),0) FROM fdocs WHERE field=?1",
+                [field],
+                |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?)),
+            )?,
+        })
+    }
+
+    /// Leaf units in test code.
+    fn test_units(&self) -> Result<Vec<UnitRow>> {
+        let mut stmt = self.conn.prepare(&format!("{UNIT_SELECT} WHERE is_leaf=1 ORDER BY id"))?;
+        let rows = stmt.query_map([], unit_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let u = r?;
+            if fields::is_test(&u.id, &u.path) {
+                out.push(u);
+            }
+        }
+        Ok(out)
     }
 
     /// Replace the derived co-change matrix (both directions stored).
@@ -540,12 +682,14 @@ impl Store {
         let mut out: Vec<CommitRow> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare("SELECT id, ts, subject FROM commits ORDER BY seq")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)))?;
+            let mut stmt = self.conn.prepare("SELECT id, ts, subject, body, merge FROM commits ORDER BY seq")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0))
+            })?;
             for row in rows {
-                let (id, ts, subject) = row?;
+                let (id, ts, subject, body, merge) = row?;
                 index.insert(id.clone(), out.len());
-                out.push(CommitRow { id, ts, subject, hunks: Vec::new(), blobs: Vec::new() });
+                out.push(CommitRow { id, ts, subject, body, merge, hunks: Vec::new(), blobs: Vec::new() });
             }
         }
         let mut stmt = self
@@ -587,6 +731,10 @@ impl Store {
             ("mentions", "SELECT unit_id, name, kind, line FROM mentions"),
             ("edges", "SELECT src, dst, kind, origin, printf('%.9f', weight), line FROM edges"),
             ("cochange", "SELECT src, dst, printf('%.9f', weight) FROM cochange"),
+            ("hist_postings", "SELECT term, unit_id, printf('%.9f', tf) FROM hist_postings"),
+            ("hist_docs", "SELECT unit_id, printf('%.9f', len) FROM hist_docs"),
+            ("fpostings", "SELECT field, term, doc, printf('%.9f', tf) FROM fpostings"),
+            ("fdocs", "SELECT field, doc, printf('%.9f', len) FROM fdocs"),
         ] {
             let mut stmt = self.conn.prepare(sql)?;
             let n = stmt.column_count();
@@ -635,6 +783,10 @@ fn delete_file_rows(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
     for table in ["postings", "definitions", "mentions", "units", "files"] {
         tx.execute(&format!("DELETE FROM {table} WHERE path=?1"), [path])?;
     }
+    // Per-unit fields; the file-level `tests` field is re-derived as a whole.
+    for table in ["fpostings", "fdocs"] {
+        tx.execute(&format!("DELETE FROM {table} WHERE path=?1 AND field IN ('path','name')"), [path])?;
+    }
     Ok(())
 }
 
@@ -647,6 +799,9 @@ fn insert_extracted(tx: &rusqlite::Transaction<'_>, ex: &Extracted) -> Result<()
     )?;
     let mut post_stmt =
         tx.prepare("INSERT INTO postings(term, unit_id, tf, path) VALUES(?1,?2,?3,?4)")?;
+    let mut fpost_stmt =
+        tx.prepare("INSERT INTO fpostings(field, term, doc, tf, path) VALUES(?1,?2,?3,?4,?5)")?;
+    let mut fdoc_stmt = tx.prepare("INSERT INTO fdocs(field, doc, len, path) VALUES(?1,?2,?3,?4)")?;
     for (ord, u) in ex.units.iter().enumerate() {
         let is_leaf = !has_children.contains(u.id.as_str());
         let (terms, len) = if is_leaf {
@@ -678,6 +833,22 @@ fn insert_extracted(tx: &rusqlite::Transaction<'_>, ex: &Extracted) -> Result<()
         ])?;
         for (term, tf) in terms {
             post_stmt.execute(params![term, u.id, tf, ex.path])?;
+        }
+        if is_leaf {
+            for (field, text) in [
+                (fields::PATH, fields::path_text(&ex.path)),
+                (fields::NAME, fields::name_text(&u.id, &ex.path)),
+            ] {
+                let tokens = tokenize(&text);
+                let mut tf: BTreeMap<String, f64> = BTreeMap::new();
+                for t in &tokens {
+                    *tf.entry(t.clone()).or_default() += 1.0;
+                }
+                fdoc_stmt.execute(params![field, u.id, tokens.len() as f64, ex.path])?;
+                for (term, n) in tf {
+                    fpost_stmt.execute(params![field, term, u.id, n, ex.path])?;
+                }
+            }
         }
     }
     let mut def_stmt =

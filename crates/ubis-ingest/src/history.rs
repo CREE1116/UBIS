@@ -16,7 +16,7 @@
 //!
 //! [`UnitKind::is_ordinal`]: ubis_core::model::UnitKind::is_ordinal
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -65,33 +65,51 @@ impl History {
         })
     }
 
-    /// Record `commits` as evidence, then derive co-change from what was
-    /// recorded (the store, not git, is the source). Returns unit pairs.
+    /// Record `commits` as evidence, then derive from what was recorded (the
+    /// store, not git, is the source). Returns co-change unit pairs.
     pub fn record_and_derive(&mut self, store: &mut Store, commits: &[Commit], p: &CoChangeParams) -> Result<usize> {
         let rows: Vec<CommitRow> = commits.iter().map(to_row).collect();
         store.replace_history(&rows)?;
-        self.derive_cochange(store, p)
-    }
-
-    /// Recompute the derived co-change table from recorded history.
-    pub fn derive_cochange(&mut self, store: &mut Store, p: &CoChangeParams) -> Result<usize> {
         let commits: Vec<Commit> = store.history()?.into_iter().map(from_row).collect();
-        self.rebuild_cochange(store, &commits, p)
+        self.derive(store, &commits, p)
     }
 
-    /// Recompute the derived co-change table from `commits` against the
-    /// current index. Returns the number of unit pairs stored.
-    pub fn rebuild_cochange(&mut self, store: &mut Store, commits: &[Commit], p: &CoChangeParams) -> Result<usize> {
+    /// Map every commit onto the current units once, then derive both views
+    /// of the same transactions `(time, message, units)`:
+    ///
+    /// * co-change — which units changed together;
+    /// * the history field — per unit, the words people used when changing it
+    ///   (searched like the code itself, see `query::Field::History`).
+    ///
+    /// Bulk commits (more than `max_set` units) feed neither: their message
+    /// says nothing specific about any one unit.
+    pub fn derive(&mut self, store: &mut Store, commits: &[Commit], p: &CoChangeParams) -> Result<usize> {
         let mut tx = Vec::new();
+        let mut field: BTreeMap<UnitId, (BTreeMap<String, f64>, f64)> = BTreeMap::new();
+        let mut changes: Vec<(UnitId, String)> = Vec::new();
         {
             let mut mapper = self.mapper(store)?;
             for c in commits {
-                let s = mapper.touched(c)?;
-                if s.len() >= 2 {
-                    tx.push((c.ts, s));
+                let units = mapper.touched(c)?;
+                if units.is_empty() || units.len() > p.max_set {
+                    continue;
+                }
+                changes.extend(units.iter().map(|u| (u.clone(), c.id.clone())));
+                let words = ubis_core::tokenize::tokenize(&format!("{}\n{}", c.subject, c.body));
+                for u in &units {
+                    let doc = field.entry(u.clone()).or_default();
+                    for w in &words {
+                        *doc.0.entry(w.clone()).or_default() += 1.0;
+                    }
+                    doc.1 += words.len() as f64;
+                }
+                if units.len() >= 2 {
+                    tx.push((c.ts, units));
                 }
             }
         }
+        store.replace_history_field(&field)?;
+        store.replace_unit_changes(&changes)?;
         store.replace_cochange(&CoChangeIndex::build(&tx, p))
     }
 
@@ -198,7 +216,7 @@ fn token_key(tokens: &BTreeSet<String>) -> u64 {
 }
 
 /// Bump when the co-change derivation or its parameters change.
-const COCHANGE_VERSION: &str = "cochange-v2";
+const COCHANGE_VERSION: &str = "derive-v3";
 pub const BASIS_KEY: &str = "git_basis";
 
 /// Everything the derived git tables depend on: HEAD, the indexed files, and
@@ -220,6 +238,8 @@ pub fn to_row(c: &Commit) -> CommitRow {
         id: c.id.clone(),
         ts: c.ts,
         subject: c.subject.clone(),
+        body: c.body.clone(),
+        merge: c.merge,
         hunks: c.hunks.iter().map(|h| (h.path.clone(), h.start, h.len)).collect(),
         blobs: c.blobs.clone(),
     }
@@ -230,6 +250,8 @@ pub fn from_row(r: CommitRow) -> Commit {
         id: r.id,
         ts: r.ts,
         subject: r.subject,
+        body: r.body,
+        merge: r.merge,
         hunks: r
             .hunks
             .into_iter()
@@ -317,6 +339,11 @@ mod tests {
             .record_and_derive(&mut store, &history, &CoChangeParams::at(now))
             .unwrap();
         assert_eq!(pairs, 1); // x–y twice; everything else below support
+        // The history field: a commit's words belong to the units it touched.
+        let with_again: Vec<String> =
+            store.hist_postings("again").unwrap().into_iter().map(|p| p.0).collect();
+        assert_eq!(with_again, vec!["a.rs::x".to_string(), "a.rs::y".to_string()]);
+        assert!(store.hist_postings("notes").unwrap().iter().all(|p| p.0.starts_with("notes.txt")));
         let n = store.cochange_from("a.rs::x").unwrap();
         assert_eq!(n.len(), 1);
         assert_eq!(n[0].0, "a.rs::y");

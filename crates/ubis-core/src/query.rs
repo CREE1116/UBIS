@@ -18,7 +18,8 @@ use serde::Serialize;
 use crate::cochange::CoChange;
 use crate::model::*;
 use crate::store::{Store, UnitRow};
-use crate::tokenize::{is_identifier_shaped, tokenize};
+use crate::fields;
+use crate::tokenize::tokenize;
 
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -70,7 +71,10 @@ pub struct Hit {
 pub struct Response {
     pub plan: Vec<(&'static str, f64)>,
     pub candidates: usize,
+    /// Source units: what to read or change.
     pub hits: Vec<Hit>,
+    /// Test units, listed apart so they do not crowd out the source list.
+    pub tests: Vec<Hit>,
 }
 
 /// Resolved query context shared by operators.
@@ -80,61 +84,115 @@ pub struct Context {
     pub anchor: Option<UnitRow>,
 }
 
+/// Named parts of a score, e.g. `[("code", 3.1), ("name", 1.2)]`.
+pub type Parts = Vec<(&'static str, f64)>;
+/// A candidate with its score and the parts it is made of.
+pub type Scored = (UnitId, f64, Parts);
+
 pub trait Operator {
     fn name(&self) -> &'static str;
-    /// Candidate units with a non-negative raw score (higher is better).
+    /// Candidate units with a raw score (higher is better).
     fn generate(&self, store: &Store, q: &Query, ctx: &Context) -> Result<Vec<(UnitId, f64)>>;
+    /// Scores that are already bits of evidence: added as they are when the
+    /// operator is alone, instead of being scaled to its maximum.
+    fn raw(&self) -> bool {
+        false
+    }
+    /// Candidates with the named parts of their score (shown as `via`).
+    fn generate_parts(&self, store: &Store, q: &Query, ctx: &Context) -> Result<Vec<Scored>> {
+        let name = self.name();
+        Ok(self.generate(store, q, ctx)?.into_iter().map(|(id, s)| (id, s, vec![(name, s)])).collect())
+    }
 }
 
 // ------------------------------------------------------------------ operators
 
-/// Okapi BM25 over leaf units.
-pub struct Lexical {
+/// Bits of evidence from the query text, summed over the fields of
+/// [`crate::fields`] (DPH per field; independent evidence adds). The `tests`
+/// field scores files; its bits go to every candidate unit of the file, and
+/// the best files also contribute their leaves.
+pub struct Text {
     pub limit: usize,
-    pub k1: f64,
-    pub b: f64,
 }
 
-impl Default for Lexical {
-    fn default() -> Self {
-        Self {
-            limit: 200,
-            k1: 1.2,
-            b: 0.75,
+/// Unit fields scored per leaf, in reporting order.
+const UNIT_FIELDS: [&str; 4] = ["code", fields::NAME, fields::PATH, "history"];
+/// Files whose leaves enter as candidates on `tests` bits alone.
+const TEST_FILES: usize = 5;
+
+impl Text {
+    /// DPH bits of one field for the weighted query: doc → bits.
+    fn field_bits(store: &Store, field: &str, terms: &[(String, f64)]) -> Result<BTreeMap<String, (f64, String)>> {
+        let (n, total) = store.field_totals(field)?;
+        let mut out: BTreeMap<String, (f64, String)> = BTreeMap::new();
+        if n <= 0.0 || total <= 0.0 {
+            return Ok(out);
         }
+        let avg = total / n;
+        for (term, qw) in terms {
+            let postings: Vec<(String, f64, f64, String)> = match field {
+                "code" => store.postings(term)?,
+                "history" => store.hist_postings(term)?,
+                _ => store.field_postings(field, term)?,
+            };
+            let cf: f64 = postings.iter().map(|p| p.1).sum();
+            for (doc, tf, len, path) in postings {
+                let w = qw * fields::dph(tf, len, avg, n, cf);
+                let e = out.entry(doc).or_insert((0.0, path));
+                e.0 += w;
+            }
+        }
+        Ok(out)
     }
-}
 
-impl Lexical {
-    /// BM25 over weighted terms (a plain query has every weight 1).
-    fn score(&self, store: &Store, terms: &[(String, f64)], scope: Option<&str>) -> Result<HashMap<UnitId, f64>> {
-        let stats = store.stats()?;
-        let n = stats.leaves as f64;
-        let avg = stats.avg_len.max(1.0);
-        let mut scores: HashMap<UnitId, f64> = HashMap::new();
-        for (term, w) in terms {
-            let postings = store.postings(term)?;
-            let df = postings.len() as f64;
-            if df == 0.0 {
-                continue;
-            }
-            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            for (id, tf, len, path) in postings {
-                if scope.is_some_and(|s| !path.starts_with(s)) {
-                    continue;
+    /// Per unit, the bits of each field (`(field, bits)`, nonzero only).
+    pub fn parts(&self, store: &Store, q: &Query) -> Result<Vec<Scored>> {
+        let terms = weighted_terms(&q.text);
+        let in_scope = |p: &str| q.scope.as_ref().is_none_or(|s| p.starts_with(s.as_str()));
+        let mut units: BTreeMap<UnitId, (String, Parts)> = BTreeMap::new();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        for field in UNIT_FIELDS {
+            for (id, (bits, path)) in Self::field_bits(store, field, &terms)? {
+                if in_scope(&path) {
+                    units.entry(id).or_insert_with(|| (path, Vec::new())).1.push((field, bits));
                 }
-                let denom = tf + self.k1 * (1.0 - self.b + self.b * len / avg);
-                *scores.entry(id).or_default() += w * idf * tf * (self.k1 + 1.0) / denom;
             }
         }
-        Ok(scores)
+        let files = Self::field_bits(store, fields::TESTS, &terms)?;
+        let mut best: Vec<(&String, f64)> =
+            files.iter().filter(|(p, (b, _))| *b > 0.0 && in_scope(p)).map(|(p, (b, _))| (p, *b)).collect();
+        best.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        for (path, _) in best.into_iter().take(TEST_FILES) {
+            for u in store.units_in_file(path)? {
+                if u.is_leaf {
+                    units.entry(u.id).or_insert_with(|| (path.clone(), Vec::new()));
+                }
+            }
+        }
+        let mut out: Vec<Scored> = units
+            .into_iter()
+            .map(|(id, (path, mut parts))| {
+                if let Some((b, _)) = files.get(&path) {
+                    if *b != 0.0 {
+                        parts.push((fields::TESTS, *b));
+                    }
+                }
+                let total = parts.iter().map(|p| p.1).sum();
+                (id, total, parts)
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(self.limit);
+        Ok(out)
     }
 }
 
 /// Query terms weighted by how the asker used them: `1 + ln(qtf)` for words
 /// repeated in the query, ×1.5 for words in the first line when there is
 /// more (a task's title says what it is about; its body adds context and
-/// noise). Measured on PR tasks (REPORT.md E11).
+/// noise). Measured on PR tasks (REPORT.md E11) and SWE-bench.
 fn weighted_terms(text: &str) -> Vec<(String, f64)> {
     const TITLE_BOOST: f64 = 1.5;
     let mut qtf: BTreeMap<String, f64> = BTreeMap::new();
@@ -152,115 +210,21 @@ fn weighted_terms(text: &str) -> Vec<(String, f64)> {
         .collect()
 }
 
-impl Operator for Lexical {
+impl Operator for Text {
     fn name(&self) -> &'static str {
-        "lexical"
+        "text"
+    }
+
+    fn raw(&self) -> bool {
+        true
     }
 
     fn generate(&self, store: &Store, q: &Query, _ctx: &Context) -> Result<Vec<(UnitId, f64)>> {
-        let terms = weighted_terms(&q.text);
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(top(self.score(store, &terms, q.scope.as_deref())?, self.limit))
-    }
-}
-
-/// Query terms that name a file path (`printer: fix …` → `crates/printer/…`).
-/// Files are scored by IDF over path tokens; leaves in the top files that
-/// contain a query term inherit their file's score, so path evidence ranks
-/// the right file's units up without flooding in unrelated ones.
-pub struct PathMatch {
-    pub files: usize,
-    pub title_only: bool,
-}
-
-impl Operator for PathMatch {
-    fn name(&self) -> &'static str {
-        "path"
+        Ok(self.parts(store, q)?.into_iter().map(|(id, s, _)| (id, s)).collect())
     }
 
-    fn generate(&self, store: &Store, q: &Query, _ctx: &Context) -> Result<Vec<(UnitId, f64)>> {
-        let text = if self.title_only { q.text.lines().next().unwrap_or("") } else { q.text.as_str() };
-        let mut terms = tokenize(text);
-        terms.sort();
-        terms.dedup();
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
-        let paths: Vec<(String, BTreeSet<String>)> = store
-            .file_paths()?
-            .into_iter()
-            .filter(|p| q.scope.as_ref().is_none_or(|s| p.starts_with(s.as_str())))
-            .map(|p| {
-                let t = tokenize(&p).into_iter().collect();
-                (p, t)
-            })
-            .collect();
-        let n = paths.len() as f64;
-        let mut file_scores: Vec<(f64, &str)> = paths
-            .iter()
-            .map(|(p, toks)| {
-                let s: f64 = terms
-                    .iter()
-                    .filter(|t| toks.contains(*t))
-                    .map(|t| {
-                        let df = paths.iter().filter(|(_, o)| o.contains(t)).count() as f64;
-                        (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
-                    })
-                    .sum();
-                (s, p.as_str())
-            })
-            .filter(|(s, _)| *s > 0.0)
-            .collect();
-        file_scores.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        file_scores.truncate(self.files);
-        let chosen: BTreeMap<&str, f64> = file_scores.iter().map(|(s, p)| (*p, *s)).collect();
-        let mut scores: HashMap<UnitId, f64> = HashMap::new();
-        for term in &terms {
-            for (id, _, _, path) in store.postings(term)? {
-                if let Some(s) = chosen.get(path.as_str()) {
-                    scores.insert(id, *s);
-                }
-            }
-        }
-        Ok(top(scores, 200))
-    }
-}
-
-/// Exact symbol-name match against definitions. A query word naming a
-/// symbol defined in `n` places gives each definition `1/n`.
-pub struct Symbol {
-    pub limit: usize,
-}
-
-impl Operator for Symbol {
-    fn name(&self) -> &'static str {
-        "symbol"
-    }
-
-    fn generate(&self, store: &Store, q: &Query, _ctx: &Context) -> Result<Vec<(UnitId, f64)>> {
-        let mut words: Vec<&str> = q
-            .text
-            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
-            .map(|w| w.trim_matches(':'))
-            .filter(|w| w.chars().count() >= 3)
-            .collect();
-        words.sort();
-        words.dedup();
-        let mut scores: HashMap<UnitId, f64> = HashMap::new();
-        for w in words {
-            let defs: Vec<_> = store
-                .symbol_definitions(w)?
-                .into_iter()
-                .filter(|(_, path)| q.scope.as_ref().is_none_or(|s| path.starts_with(s.as_str())))
-                .collect();
-            let n = defs.len() as f64;
-            for (id, _) in defs {
-                *scores.entry(id).or_default() += 1.0 / n;
-            }
-        }
-        Ok(top(scores, self.limit))
+    fn generate_parts(&self, store: &Store, q: &Query, _ctx: &Context) -> Result<Vec<Scored>> {
+        self.parts(store, q)
     }
 }
 
@@ -376,23 +340,15 @@ pub struct Plan {
     pub ops: Vec<(Box<dyn Operator>, f64)>,
 }
 
-/// Deterministic routing from query shape to operator weights.
+/// Deterministic routing: the text alone, or the anchor's neighbourhood
+/// refined by the text.
 pub fn plan(q: &Query) -> Plan {
-    let words: Vec<&str> = q.text.split_whitespace().collect();
-    let identifier_query =
-        !words.is_empty() && words.len() <= 3 && words.iter().any(|w| is_identifier_shaped(w));
     let mut ops: Vec<(Box<dyn Operator>, f64)> = Vec::new();
-    if !words.is_empty() {
+    if !q.text.trim().is_empty() {
         // With an anchor, the anchor is the stronger evidence; text refines.
         // (Measured with ubis-bench: text at full weight drowned anchor signals.)
-        let (lex, sym) = match (q.anchor.is_some(), identifier_query) {
-            (true, _) => (0.25, 0.25),
-            (false, true) => (1.0, 1.2),
-            (false, false) => (1.0, 0.3),
-        };
-        ops.push((Box::new(Lexical::default()), lex));
-        ops.push((Box::new(Symbol { limit: 50 }), sym));
-        ops.push((Box::new(PathMatch { files: 5, title_only: PATH_TITLE_ONLY }), lex * PATH_WEIGHT));
+        let w = if q.anchor.is_some() { ANCHOR_TEXT_WEIGHT } else { 1.0 };
+        ops.push((Box::new(Text { limit: 400 }), w));
     }
     if q.anchor.is_some() {
         ops.push((Box::new(RefsIn { limit: 50 }), 0.8));
@@ -407,12 +363,11 @@ pub fn plan(q: &Query) -> Plan {
 
 // ------------------------------------------------------------------- cascade
 
-/// `path` weight relative to `lexical`. Measured on PR tasks (REPORT.md E7):
-/// 0.5 balances ripgrep/requests/flask gains against fd; 1.0 hurt flask.
-pub const PATH_WEIGHT: f64 = 0.5;
-/// Match paths against the first line only: scopes like `printer:` live in
-/// titles; PR bodies add noise (measured: title-only better on 3 of 4).
-pub const PATH_TITLE_ONLY: bool = true;
+/// Weight of the (max-scaled) text evidence next to an anchor.
+pub const ANCHOR_TEXT_WEIGHT: f64 = 0.25;
+/// Test units are listed apart from the source list, at most this many.
+/// Measured (SWE-bench): tests outranked the unit to change in 69% of tasks.
+pub const TESTS_K: usize = 3;
 /// Contributions below this are left out of `via` (they would print as 0.00).
 pub const VIA_MIN: f64 = 0.005;
 pub const LIFT_MIN_SIBLINGS: usize = 4;
@@ -437,26 +392,31 @@ pub fn search_with(store: &Store, q: &Query, plan: Plan) -> Result<Response> {
     };
     let ctx = Context { anchor_set, anchor };
 
-    // Stage A + B.
+    // Stage A + B. Bits add as they are when the text is the only evidence;
+    // otherwise every operator is scaled to its maximum and weighted.
+    let alone = plan.ops.len() == 1;
     let mut total: BTreeMap<UnitId, (f64, Vec<Via>)> = BTreeMap::new();
     let mut plan_desc = Vec::new();
     for (op, w) in &plan.ops {
         plan_desc.push((op.name(), *w));
-        let cands = op.generate(store, q, &ctx)?;
+        let cands = op.generate_parts(store, q, &ctx)?;
         let max = cands.iter().map(|c| c.1).fold(0.0, f64::max);
-        if max <= 0.0 {
+        let scale = if op.raw() && alone {
+            *w
+        } else if max > 0.0 {
+            w / max
+        } else {
             continue;
-        }
-        for (id, raw) in cands {
-            let c = w * raw / max;
+        };
+        for (id, raw, parts) in cands {
             let e = total.entry(id).or_insert((0.0, Vec::new()));
-            e.0 += c;
-            // Negligible evidence still counts in the score but is not shown.
-            if c >= VIA_MIN {
-                e.1.push(Via {
-                    op: op.name(),
-                    contribution: c,
-                });
+            e.0 += raw * scale;
+            for (name, p) in parts {
+                let c = p * scale;
+                // Negligible evidence still counts in the score but is not shown.
+                if c >= VIA_MIN {
+                    e.1.push(Via { op: name, contribution: c });
+                }
             }
         }
     }
@@ -476,33 +436,37 @@ pub fn search_with(store: &Store, q: &Query, plan: Plan) -> Result<Response> {
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
     ranked.truncate(200);
 
-    // Stage C.
-    let ranked = collapse_ancestors(store, ranked)?;
-    let ranked = lift_siblings(store, ranked, q.k_max)?;
-    let scores: Vec<f64> = ranked.iter().map(|r| r.1).collect();
+    // Stage C, for the source list and the test list apart.
+    let (tests, sources): (Ranked, Ranked) =
+        ranked.into_iter().partition(|r| fields::is_test(&r.0.id, &r.0.path));
+    let sources = collapse_ancestors(store, sources)?;
+    let sources = lift_siblings(store, sources, q.k_max)?;
+    let scores: Vec<f64> = sources.iter().map(|r| r.1.max(0.0)).collect();
     let k = adaptive_k_range(&scores, q.k_min.unwrap_or(K_MIN), q.k_max);
+    let tests = collapse_ancestors(store, tests)?;
+    let n_tests = tests.iter().take(TESTS_K).filter(|r| r.1 > 0.0).count();
 
-    let hits = ranked
-        .into_iter()
-        .take(k)
-        .map(|(u, score, via, lifted)| Hit {
-            signature: u.signature(),
-            id: u.id,
-            path: u.path,
-            start_line: u.start_line,
-            end_line: u.end_line,
-            kind: u.kind,
-            label: u.label,
-            score,
-            via,
-            lifted,
-        })
-        .collect();
     Ok(Response {
         plan: plan_desc,
         candidates,
-        hits,
+        hits: sources.into_iter().take(k).map(to_hit).collect(),
+        tests: tests.into_iter().take(n_tests).map(to_hit).collect(),
     })
+}
+
+fn to_hit((u, score, via, lifted): (UnitRow, f64, Vec<Via>, usize)) -> Hit {
+    Hit {
+        signature: u.signature(),
+        id: u.id,
+        path: u.path,
+        start_line: u.start_line,
+        end_line: u.end_line,
+        kind: u.kind,
+        label: u.label,
+        score,
+        via,
+        lifted,
+    }
 }
 
 type Ranked = Vec<(UnitRow, f64, Vec<Via>, usize)>;

@@ -21,6 +21,11 @@ pub struct Commit {
     pub id: String,
     pub ts: i64,
     pub subject: String,
+    /// Message body (for a merge: usually the pull request title/text).
+    pub body: String,
+    /// A merge commit; its hunks are the diff against the first parent,
+    /// i.e. the whole merged change.
+    pub merge: bool,
     pub hunks: Vec<Hunk>,
     /// Post-commit blob of each changed path (deleted paths omitted).
     pub blobs: Vec<(String, String)>,
@@ -62,7 +67,8 @@ pub fn is_repo(path: &Path) -> bool {
 }
 
 /// Commits reachable from `rev` along first-parent history, oldest first,
-/// with their hunks. Merge commits contribute no hunks of their own.
+/// with their hunks. A merge is recorded as one change against its first
+/// parent (a merged pull request as a unit, with its message).
 pub fn history(repo: &Path, rev: &str, max_commits: usize) -> Result<Vec<Commit>> {
     let n = format!("-n{max_commits}");
     let raw = git(
@@ -70,14 +76,14 @@ pub fn history(repo: &Path, rev: &str, max_commits: usize) -> Result<Vec<Commit>
         &[
             "log",
             "--first-parent",
-            "--no-merges",
+            "--diff-merges=first-parent",
             "--no-color",
             "--no-ext-diff",
             "-M",
             "--raw",
             "--no-abbrev",
             "--unified=0",
-            "--format=%x1e%H%x1f%ct%x1f%s",
+            "--format=%x1e%H%x1f%ct%x1f%P%x1f%s%x1f%b%x1d",
             "-p",
             &n,
             rev,
@@ -93,12 +99,15 @@ pub fn history(repo: &Path, rev: &str, max_commits: usize) -> Result<Vec<Commit>
 pub fn parse_log(raw: &str) -> Vec<Commit> {
     let mut out = Vec::new();
     for record in raw.split('\u{1e}').filter(|r| !r.trim().is_empty()) {
-        let mut lines = record.lines();
-        let header = lines.next().unwrap_or("");
-        let mut parts = header.split('\u{1f}');
-        let id = parts.next().unwrap_or("").to_string();
+        // `id ␟ time ␟ parents ␟ subject ␟ body ␝ raw/patch lines`
+        let (header, rest) = record.split_once('\u{1d}').unwrap_or((record, ""));
+        let lines = rest.lines();
+        let mut parts = header.splitn(5, '\u{1f}');
+        let id = parts.next().unwrap_or("").trim().to_string();
         let ts = parts.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+        let merge = parts.next().unwrap_or("").split_whitespace().count() > 1;
         let subject = parts.next().unwrap_or("").to_string();
+        let body = parts.next().unwrap_or("").trim().to_string();
         let mut hunks = Vec::new();
         let mut blobs = Vec::new();
         let mut current: Option<String> = None;
@@ -134,6 +143,8 @@ pub fn parse_log(raw: &str) -> Vec<Commit> {
                 id,
                 ts,
                 subject,
+                body,
+                merge,
                 hunks,
                 blobs,
             });
@@ -221,7 +232,7 @@ pub fn diff(repo: &Path, base: &str, head: &str) -> Result<Commit> {
         &["diff", "--no-color", "--no-ext-diff", "-M", "--raw", "--no-abbrev", "--unified=0", base, head],
     )?;
     let ts = git(repo, &["show", "-s", "--format=%ct", head])?;
-    let record = format!("\u{1e}{head}\u{1f}{}\u{1f}\n{raw}", ts.trim());
+    let record = format!("\u{1e}{head}\u{1f}{}\u{1f}\u{1f}\u{1f}\u{1d}\n{raw}", ts.trim());
     parse_log(&record).pop().context("empty diff record")
 }
 
@@ -275,10 +286,12 @@ mod tests {
 
     #[test]
     fn parses_hunks() {
-        let raw = "\u{1e}abc\u{1f}100\u{1f}Fix thing\n\n:100644 100644 1111 2222 M\tsrc/a.rs\n:100644 000000 3333 0000 D\told.md\ndiff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3,0 +4,2 @@ fn x\n+a\n+b\n@@ -10 +12 @@\n-x\n+y\n@@ -20,3 +21,0 @@\n-gone\ndiff --git a/old.md b/old.md\n--- a/old.md\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n";
+        let raw = "\u{1e}abc\u{1f}100\u{1f}p1 p2\u{1f}Fix thing\u{1f}Body line\nmore\u{1d}\n:100644 100644 1111 2222 M\tsrc/a.rs\n:100644 000000 3333 0000 D\told.md\ndiff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3,0 +4,2 @@ fn x\n+a\n+b\n@@ -10 +12 @@\n-x\n+y\n@@ -20,3 +21,0 @@\n-gone\ndiff --git a/old.md b/old.md\n--- a/old.md\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n";
         let c = parse_log(raw);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].subject, "Fix thing");
+        assert_eq!(c[0].body, "Body line\nmore");
+        assert!(c[0].merge);
         assert_eq!(c[0].blobs, vec![("src/a.rs".to_string(), "2222".to_string())]);
         assert_eq!(
             c[0].hunks,

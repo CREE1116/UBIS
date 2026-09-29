@@ -8,16 +8,20 @@ units the PR changed as the answer.
     fetch_pr_tasks.py OWNER/REPO LOCAL_CLONE OUT.jsonl [--limit 200]
 
 Needs `gh` (authenticated). PRs whose merge commit is not in the local clone
-are skipped. Output lines: {"id", "base", "head", "text"}, oldest first.
+are skipped. Output lines: {"id", "created", "base", "head", "text"}, oldest
+first. `created` (PR creation, unix seconds) bounds the history the harness
+may use: an agent handed the task knows nothing committed after that — in
+particular not the PR's own earlier commits when a PR is rebased in.
 """
 import json, re, subprocess, sys
+from datetime import datetime
 
 def main():
     repo, clone, out = sys.argv[1:4]
     limit = sys.argv[sys.argv.index("--limit") + 1] if "--limit" in sys.argv else "200"
     prs = json.loads(subprocess.check_output(
         ["gh", "pr", "list", "-R", repo, "--state", "merged", "--limit", limit,
-         "--json", "number,title,body,mergeCommit,mergedAt,author"]))
+         "--json", "number,title,body,mergeCommit,mergedAt,createdAt,author"]))
     tasks = []
     for pr in prs:
         author = pr.get("author") or {}
@@ -33,7 +37,8 @@ def main():
         body = pr.get("body") or ""
         body = re.sub(r"<!--.*?-->", "", body, flags=re.S)  # PR template comments
         body = body.strip()[:2000]
-        tasks.append({"id": f"#{pr['number']}", "at": pr["mergedAt"], "base": r.stdout.strip(),
+        created = int(datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00")).timestamp())
+        tasks.append({"id": f"#{pr['number']}", "at": pr["mergedAt"], "created": created, "base": r.stdout.strip(),
                       "head": head, "text": (pr["title"] + "\n\n" + body).strip()})
     tasks.sort(key=lambda t: t["at"])
     with open(out, "w") as f:

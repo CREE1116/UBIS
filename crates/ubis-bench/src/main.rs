@@ -72,6 +72,14 @@ struct Args {
     max_commits: usize,
     #[arg(long)]
     json: bool,
+    /// Cut the ranked list at this many read tokens instead of at K
+    /// (run with `-k 30 --k-min 30` so the list is long enough).
+    #[arg(long)]
+    budget: Option<f64>,
+    /// Count only gold units in code (not `.md`/`.rst`/`.txt`): changelog
+    /// entries every PR adds are cheap to hit and say little about retrieval.
+    #[arg(long)]
+    gold_code: bool,
     /// Print each query and its outcome.
     #[arg(short, long)]
     verbose: bool,
@@ -137,14 +145,20 @@ fn main() -> Result<()> {
     if let Some(tasks) = &args.tasks {
         return run_tasks(&args, &repo, tasks);
     }
-    let commits = ubis_git::history(&repo, "HEAD", args.max_commits)?;
-    if commits.len() < 4 {
-        bail!("need at least 4 commits, found {}", commits.len());
+    // Queries are non-merge commits (the last `max_commits` of them, as
+    // always); merges on the first-parent line are evidence only — a merged
+    // pull request recorded as one change with its message.
+    let all = ubis_git::history(&repo, "HEAD", 100_000)?;
+    let direct: Vec<usize> = (0..all.len()).filter(|&i| !all[i].merge).collect();
+    let window = &direct[direct.len().saturating_sub(args.max_commits)..];
+    if window.len() < 4 {
+        bail!("need at least 4 commits, found {}", window.len());
     }
-    let holdout = args.holdout.min(commits.len() / 2).max(1);
-    let split = commits.len() - holdout;
-    let t0 = &commits[split - 1];
-    let held = &commits[split..];
+    let holdout = args.holdout.min(window.len() / 2).max(1);
+    let split = window.len() - holdout;
+    let t0 = &all[window[split - 1]];
+    let evidence = &all[window[0]..=window[split - 1]];
+    let held: Vec<&ubis_git::Commit> = window[split..].iter().map(|&i| &all[i]).collect();
 
     // Evidence: the tree at T0.
     let tmp = tempfile::tempdir()?;
@@ -155,7 +169,7 @@ fn main() -> Result<()> {
     eprintln!(
         "T0 = {} ({} commits of evidence, {} held out); index: {} files, {} leaves, {} edges",
         &t0.id[..10],
-        split,
+        evidence.len(),
         held.len(),
         report.added,
         stats.leaves,
@@ -167,7 +181,7 @@ fn main() -> Result<()> {
     let mut hist = History::open(&repo)?;
     let pairs = hist.record_and_derive(
         &mut store,
-        &commits[..split],
+        evidence,
         &CoChangeParams {
             tau: args.cochange_tau * 86400.0,
             min_support: args.cochange_support,
@@ -222,6 +236,9 @@ fn print_table(args: &Args, aggs: &BTreeMap<&'static str, Agg>) -> Result<()> {
 #[derive(serde::Deserialize)]
 struct Task {
     id: String,
+    /// PR creation time: history evidence must predate it.
+    #[serde(default)]
+    created: Option<i64>,
     base: String,
     head: String,
     text: String,
@@ -259,10 +276,17 @@ fn run_tasks(args: &Args, repo: &std::path::Path, path: &std::path::Path) -> Res
                 &owned
             }
         };
+        // Only what was committed before the task existed (a rebased PR's
+        // own earlier commits sit before `base` but after `created`).
+        let history: Vec<ubis_git::Commit> = history
+            .iter()
+            .filter(|c| task.created.is_none_or(|t| c.ts < t))
+            .cloned()
+            .collect();
         let now = history.last().map(|c| c.ts).unwrap_or(0);
         hist.record_and_derive(
             &mut store,
-            history,
+            &history,
             &CoChangeParams {
                 tau: args.cochange_tau * 86400.0,
                 min_support: args.cochange_support,
@@ -271,7 +295,16 @@ fn run_tasks(args: &Args, repo: &std::path::Path, path: &std::path::Path) -> Res
             },
         )?;
         let change = ubis_git::diff(repo, &task.base, &task.head)?;
-        let gold = hist.mapper(&store)?.touched(&change)?;
+        let mut gold = hist.mapper(&store)?.touched(&change)?;
+        if args.gold_code {
+            let mut kept = BTreeSet::new();
+            for g in gold {
+                if store.unit(&g)?.is_some_and(|u| !is_prose(&u.path)) {
+                    kept.insert(g);
+                }
+            }
+            gold = kept;
+        }
         if gold.is_empty() {
             skipped_empty += 1;
             continue;
@@ -405,9 +438,15 @@ fn run(
         }
     }
     let resp = search_with(store, q, p)?;
-    let ids: Vec<String> = resp.hits.iter().map(|h| h.id.clone()).collect();
+    // The agent reads both lists: sources, then tests.
+    let mut ids: Vec<String> = resp.hits.iter().chain(&resp.tests).map(|h| h.id.clone()).collect();
+    if let Some(b) = args.budget {
+        ids = budget_prefix(store, ids, b)?;
+    }
     let (r, t) = score(store, &ids, gold)?;
-    Ok((r, ids.len(), t, ids, tokens_of(&ubis_core::render::hits(&resp.hits))))
+    // List cost: the rendered lines of what is kept.
+    let kept: Vec<ubis_core::Hit> = resp.hits.iter().filter(|h| ids.contains(&h.id)).cloned().collect();
+    Ok((r, ids.len(), t, ids.clone(), tokens_of(&ubis_core::render::hits(&kept))))
 }
 
 /// Recall of `gold` by returned units (a hit covers its descendants) and the
@@ -494,4 +533,24 @@ fn grep_read(
     }
     let tokens: f64 = chosen.iter().map(|p| tokens_of(&files.texts[*p])).sum();
     Ok((found as f64 / gold.len() as f64, tokens))
+}
+
+fn is_prose(path: &str) -> bool {
+    [".md", ".rst", ".txt"].iter().any(|e| path.ends_with(e))
+}
+
+/// Longest rank-order prefix whose spans fit in `budget` read tokens (at
+/// least one hit).
+fn budget_prefix(store: &Store, ids: Vec<String>, budget: f64) -> Result<Vec<String>> {
+    let mut used = 0.0;
+    let mut out = Vec::new();
+    for id in ids {
+        let t: f64 = store.subtree(&id)?.iter().filter(|u| u.is_leaf).map(|u| tokens_of(&u.text)).sum();
+        if !out.is_empty() && used + t > budget {
+            break;
+        }
+        used += t;
+        out.push(id);
+    }
+    Ok(out)
 }

@@ -33,7 +33,8 @@ crates/ubis-core/src/
   store.rs     SQLite 스키마, 파일 단위 교체, canonical_dump (동등성 테스트용)
   resolve.rs   mentions ⋈ definitions → edges (same_file > global, Owner::method, bridge ≤3)
   cochange.rs  commits/hunks → co-change 행렬(파생 테이블 `cochange`), CoChange operator
-  query.rs     Operator trait, 8개 operator(+path), planner, Stage B/C, adaptive_k
+  fields.rs    검색 필드(code/name/path/history/tests)와 DPH, 테스트 경로 판정, tests 필드 파생
+  query.rs     Operator trait, Text(필드 DPH 합) + anchor operator들, planner, Stage B/C, 테스트 목록 분리
   tokenize.rs  코드 subword, 영어 어간(+원형), 한글 bigram; tokenize_raw(어간 없음, 채점용)
 crates/ubis-ingest/src/
   lib.rs       admit(텍스트 판별), extract(디스패치), walk, index_dir, index_paths
@@ -45,7 +46,8 @@ crates/ubis-ingest/src/
   prose.rs     bridge mention 추출, 문단 분할
 crates/ubis-git/   git log -p --raw --unified=0 파싱(hunk + blob id), BlobReader(cat-file --batch), archive
 crates/ubis-cli/   ubis: index / watch / find / near / refs / open / status
-crates/ubis-bench/ 시간 분할 평가 (text / anchor / anchor+text / find->near, grep-read baseline), --tasks PR 태스크 모드
+crates/ubis-bench/ 시간 분할 평가 (text / anchor / anchor+text / find->near, grep-read baseline), --tasks PR 태스크 모드, --gold-code
+  src/rank.rs  ubis-rank: 컷 없는 상위 K (외부 평가용, UBIS-V2 lab의 parity.py)
   scripts/fetch_pr_tasks.py  gh로 병합 PR → 태스크 JSONL
 integrations/skills/ubis/SKILL.md   에이전트용 사용법
 ```
@@ -96,6 +98,19 @@ cargo build --release
 - tree-sitter는 Rust/Python/Java만. 나머지 코드는 문단 분할 텍스트로 들어간다.
 - PDF, config 키 경로, LaTeX 구조 미지원.
 - 커밋 제목은 거친 질의라 text 모드 절대값은 신뢰도가 낮다.
+
+## v3 (E13, v0.6.0)
+
+UBIS-V2 lab(SWE-bench, dev/held-out 분리)에서 찾은 모델을 이식했다. 상세는 REPORT.md E13, 과정은 `~/code/UBIS-V2/NOTES.md`.
+
+- 텍스트 점수 = 필드별 DPH bit 합(code, name, path, history, 파일 단위 tests). 가중치·파라미터 없음. BM25/symbol/path operator 제거.
+- 테스트 unit은 `tests:` 목록(최대 3)으로 분리.
+- E12(history 필드, merge 증거, created 컷)도 여기 포함된다. history는 가중치 없이 한 필드.
+- 스키마 v4: `fpostings`/`fdocs`(path·name은 파일 단위 교체, tests는 `rebuild_edges`에서 전체 재파생).
+- 측정: PR 태스크 text recall 네 코퍼스 모두 상승(fd .371→.471, ripgrep .328→.505, requests .329→.423, flask .316→.348). 토큰은 약 2배(테스트 목록 + 큰 unit). 같은 토큰에서는 fd·ripgrep 크게 우세, 코드 정답 기준 flask 우세, requests 비슷.
+- 같은 출력 예산에서 Aider repo map 대비 정답 함수 위치를 1k 토큰에서 .638 vs .068 (REPORT.md E13). 이것이 README의 주장이다.
+- 남은 일: 예산 컷을 기본 출력으로 할지, unit당 토큰, anchor 모드 가중치 재측정.
+- 기준선 재현: `git worktree add /tmp/claude-501/ubis-v05 85ff6b9`, 태스크 파일 `~/code/ubis-corpora/tasks/`.
 
 ## 7. 다음 작업 (우선순위 순)
 

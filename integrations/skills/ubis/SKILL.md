@@ -10,6 +10,6 @@ ubis find "<what the code does, or the task title>"   # → path:start-end spans
 ubis near <path:line | unit-id | Name>                # → callers, callees, siblings, co-changed units
 ```
 
-Read only the returned spans. Typical flow: `find` with the task, then `near` on the best hit to see what else the change touches.
+Read only the returned spans. Tests that exercise the matches come after a `tests:` line. Typical flow: `find` with the task, then `near` on the best hit to see what else the change touches.
 
 Results are candidates with evidence (`via`), not proof. The index refreshes itself on every call.

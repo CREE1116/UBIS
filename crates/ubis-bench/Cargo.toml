@@ -18,3 +18,8 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+
+# Full ranking (no adaptive cut) for external evaluation (SWE-bench lab).
+[[bin]]
+name = "ubis-rank"
+path = "src/rank.rs"

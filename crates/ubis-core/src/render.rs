@@ -10,7 +10,17 @@
 //! `path:start-end` is both what to read and a valid unit reference for
 //! `near`/`open`, so the full ID is not repeated.
 
-use crate::query::Hit;
+use crate::query::{Hit, Response};
+
+/// Source list, then the test list (when any) under `tests:`.
+pub fn response(r: &Response) -> String {
+    let mut s = hits(&r.hits);
+    if !r.tests.is_empty() {
+        s += "tests:\n";
+        s += &hits(&r.tests);
+    }
+    s
+}
 
 /// Candidate list as printed by `ubis find` / `ubis near`.
 pub fn hits(hits: &[Hit]) -> String {

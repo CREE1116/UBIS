@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ubis_core::query::{search, Hit, Query};
+use ubis_core::query::{search, Query, Response};
 use ubis_core::{Edge, Store, UnitRow};
 use ubis_ingest::IndexReport;
 
@@ -173,7 +173,7 @@ impl Session {
         out
     }
 
-    pub fn find(&self, text: &str, anchor: Option<&str>, scope: Option<&str>, k: usize) -> Result<Vec<Hit>> {
+    pub fn find(&self, text: &str, anchor: Option<&str>, scope: Option<&str>, k: usize) -> Result<Response> {
         let anchor = match anchor {
             Some(a) => Some(self.resolve(a)?.id),
             None => None,
@@ -188,10 +188,10 @@ impl Session {
             k_max: k,
             k_min: None,
         };
-        Ok(search(&self.store, &q)?.hits)
+        search(&self.store, &q)
     }
 
-    pub fn near(&self, unit: &str, k: usize) -> Result<Vec<Hit>> {
+    pub fn near(&self, unit: &str, k: usize) -> Result<Response> {
         self.find("", Some(unit), None, k)
     }
 
@@ -218,8 +218,8 @@ impl Session {
 
     // ------------------------------------------------------------ rendering
 
-    pub fn render_hits(hits: &[Hit]) -> String {
-        ubis_core::render::hits(hits)
+    pub fn render_response(r: &Response) -> String {
+        ubis_core::render::response(r)
     }
 
     pub fn render_open(u: &UnitRow, children: &[UnitRow]) -> String {
